@@ -209,10 +209,86 @@ describe('formatSarif', () => {
     expect(pass.locations[0].physicalLocation.region).toBeUndefined();
   });
 
-  it('emits an empty locations array when filePath is empty (SKIP findings)', () => {
+  it('emits a synthetic %SRCROOT% location when filePath is empty (tree-wide findings)', () => {
+    // GitHub Code Scanning rejects results with zero locations
+    // ("locationFromSarifResult: expected at least one location"). The
+    // emitter must synthesize a scan-root anchor instead of dropping the
+    // finding's location entirely.
     const sarif = JSON.parse(formatSarif(sampleFindings));
     const skip = sarif.runs[0].results.find((r: { ruleId: string }) => r.ruleId === 'S-9.x.1');
-    expect(skip.locations).toEqual([]);
+    expect(skip.locations).toHaveLength(1);
+    expect(skip.locations[0].physicalLocation.artifactLocation.uri).toBe('.');
+    expect(skip.locations[0].physicalLocation.artifactLocation.uriBaseId).toBe('%SRCROOT%');
+  });
+
+  it('rewrites plan:<address> URIs to a synthetic %SRCROOT% location and preserves the plan address in properties', () => {
+    // `plan:<address>` is an unknown URI scheme to GitHub - it silently
+    // strips the location, leaving zero locations on the result, and then
+    // drops the result. Rewrite to a resolvable URI while preserving the
+    // citation in properties.planAddress.
+    const planFindings: Finding[] = [
+      {
+        ruleId: 'S-12.x.del',
+        status: 'FAIL',
+        filePath: 'plan:module.bedrock_governance.aws_bedrock_model_invocation_logging_configuration.this',
+        description: 'Bedrock invocation logging scheduled for destruction',
+        remediation: 'Restore the resource before applying.',
+        regulatoryReference: 'EU AI Act Article 12(1)',
+      },
+    ];
+    const sarif = JSON.parse(formatSarif(planFindings));
+    const result = sarif.runs[0].results[0];
+    expect(result.locations).toHaveLength(1);
+    expect(result.locations[0].physicalLocation.artifactLocation.uri).toBe('.');
+    expect(result.locations[0].physicalLocation.artifactLocation.uriBaseId).toBe('%SRCROOT%');
+    expect(result.locations[0].properties.planAddress).toBe(
+      'module.bedrock_governance.aws_bedrock_model_invocation_logging_configuration.this',
+    );
+  });
+
+  it('declares originalUriBaseIds["%SRCROOT%"] on each run so GitHub can anchor synthetic locations', () => {
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    const baseIds = sarif.runs[0].originalUriBaseIds;
+    expect(baseIds).toBeDefined();
+    expect(baseIds['%SRCROOT%']).toBeDefined();
+    expect(baseIds['%SRCROOT%'].uri).toMatch(/^file:/);
+  });
+
+  it('guarantees every result carries at least one location (GitHub upload invariant)', () => {
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    for (const r of sarif.runs[0].results as { ruleId: string; locations: unknown[] }[]) {
+      expect(r.locations.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('emits only resolvable URIs (no plan:// or other unknown schemes)', () => {
+    // Mix the sample (which has an empty-filePath SKIP) with a synthetic
+    // plan-prefixed finding to exercise both rewrites in one pass.
+    const findings: Finding[] = [
+      ...sampleFindings,
+      {
+        ruleId: 'S-12.x.del',
+        status: 'WARN',
+        filePath: 'plan:aws_s3_bucket.logs',
+        description: 'Replacement scheduled',
+        remediation: '',
+        regulatoryReference: 'EU AI Act Article 12(1)',
+      },
+    ];
+    const sarif = JSON.parse(formatSarif(findings));
+    for (const r of sarif.runs[0].results as {
+      locations: { physicalLocation: { artifactLocation: { uri: string } } }[];
+    }[]) {
+      for (const loc of r.locations) {
+        const uri = loc.physicalLocation.artifactLocation.uri;
+        // Either a relative URI (no scheme), or a recognised scheme. plan:
+        // and other custom schemes must never leak through to GitHub.
+        const schemeMatch = uri.match(/^([a-zA-Z][a-zA-Z0-9+\-.]*):/);
+        if (schemeMatch) {
+          expect(schemeMatch[1].toLowerCase()).toBe('file');
+        }
+      }
+    }
   });
 
   it('folds description + remediation into message.text', () => {

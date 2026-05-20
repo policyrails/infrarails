@@ -203,7 +203,7 @@ const SARIF_SCHEMA =
   'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json';
 const SARIF_VERSION = '2.1.0';
 const TOOL_NAME = 'infrarails';
-const TOOL_VERSION = '0.1.0';
+const TOOL_VERSION = '0.2.1';
 const TOOL_INFO_URI = 'https://github.com/vbalaji/infrarails';
 
 type SarifLevel = 'none' | 'note' | 'warning' | 'error';
@@ -236,13 +236,48 @@ function sarifKind(status: FindingStatus): SarifKind {
 
 interface SarifLocation {
   physicalLocation: {
-    artifactLocation: { uri: string };
+    artifactLocation: { uri: string; uriBaseId?: string };
     region?: { startLine: number };
   };
+  properties?: Record<string, unknown>;
 }
 
+// `%SRCROOT%` is the de-facto SARIF uriBaseId for "checkout root", honoured by
+// GitHub Code Scanning, CodeQL, and Microsoft's SARIF reference. Declared
+// once on each run via originalUriBaseIds; referenced from synthetic
+// locations whose URI must anchor to *something* GitHub can resolve.
+const SARIF_SRCROOT = '%SRCROOT%';
+
+// SARIF locations for a Finding. Three input shapes, one output contract
+// (every result has >=1 location, every URI is GitHub-resolvable):
+//
+//   1. Real .tf path  → emit verbatim. Preserves the absolute/relative path
+//      shape that upload-sarif already normalises today.
+//   2. `plan:<addr>`  → plan-only resource with no on-disk HCL. Emit a
+//      synthetic %SRCROOT% location so GitHub accepts the result; stash the
+//      original plan address in properties.planAddress so the citation is
+//      not lost.
+//   3. empty string   → tree-wide finding (PASS/SKIP/INCONCLUSIVE for "no
+//      Bedrock in tree", "plan does not destroy any resources", etc.). Same
+//      synthetic %SRCROOT% location.
+//
+// Background: GitHub Code Scanning's upload-sarif rejects unknown URI schemes
+// (silently strips the location) and refuses results with zero locations
+// ("locationFromSarifResult: expected at least one location"). Both failure
+// modes drop findings on the floor. The synthetic-location fallback surfaces
+// them at directory level instead.
 function sarifLocations(f: Finding): SarifLocation[] {
-  if (!f.filePath) return [];
+  if (!f.filePath || f.filePath.startsWith('plan:')) {
+    const loc: SarifLocation = {
+      physicalLocation: {
+        artifactLocation: { uri: '.', uriBaseId: SARIF_SRCROOT },
+      },
+    };
+    if (f.filePath?.startsWith('plan:')) {
+      loc.properties = { planAddress: f.filePath.slice('plan:'.length) };
+    }
+    return [loc];
+  }
   const loc: SarifLocation = {
     physicalLocation: { artifactLocation: { uri: f.filePath } },
   };
@@ -317,6 +352,15 @@ export function formatSarif(findings: Finding[]): string {
     };
     const idx = ruleIndexById.get(f.ruleId);
     if (idx !== undefined) result.ruleIndex = idx;
+    // Invariant: every result must carry >=1 location or GitHub Code
+    // Scanning drops it with "expected at least one location". Throw rather
+    // than ship rejected SARIF.
+    if (!Array.isArray(result.locations) || (result.locations as unknown[]).length < 1) {
+      throw new Error(
+        `SARIF emitter produced a result with no locations for ruleId=${f.ruleId}; ` +
+          `every result must carry at least one location.`,
+      );
+    }
     return result;
   });
 
@@ -332,6 +376,13 @@ export function formatSarif(findings: Finding[]): string {
             informationUri: TOOL_INFO_URI,
             rules,
           },
+        },
+        // GitHub Code Scanning anchors uriBaseId-bearing relative URIs against
+        // the checkout root via the %SRCROOT% sentinel; the literal `file:///`
+        // value is symbolic and ignored by GitHub but required by the SARIF
+        // spec to make originalUriBaseIds entries well-formed.
+        originalUriBaseIds: {
+          [SARIF_SRCROOT]: { uri: 'file:///' },
         },
         results,
       },

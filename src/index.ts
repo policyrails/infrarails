@@ -13,7 +13,7 @@ const program = new Command();
 program
   .name('infrarails')
   .description('Scan Terraform HCL files for EU AI Act Article 12 compliance gaps')
-  .version('0.2.0')
+  .version('0.2.1')
   .argument('<directory>', 'Directory containing Terraform .tf files')
   .option(
     '-f, --format <format>',

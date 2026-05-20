@@ -326,6 +326,8 @@ Page 1 of two real scans, generated with `--format pdf`:
 
 Each result carries `partialFingerprints` so GitHub correlates the same finding across re-runs even when line numbers shift, plus a `properties` bag with the parsed `frameworks` array, the raw framework reference strings, and the `unresolvedReason` for INCONCLUSIVE findings. The tool driver advertises the full rule catalogue so SARIF consumers have a stable list of what infrarails can detect.
 
+**Plan-only findings and tree-wide findings** (resources discovered only via `--plan`, deletion findings, and tree-level PASS/SKIP results like "no Bedrock in scanned tree") are anchored to a synthetic `%SRCROOT%` location and surface as **directory-level alerts** rather than file annotations - there is no `.tf` line number to point at. For plan-sourced findings, the full Terraform plan address (e.g. `module.bedrock_governance.aws_X.y`) is preserved on the location's `properties.planAddress` so audit citations stay intact. The run declares `originalUriBaseIds["%SRCROOT%"]` so GitHub anchors all relative URIs against the checkout root.
+
 ### GitLab CI
 
 **HCL-only** (no `terraform plan` step needed):

@@ -67,12 +67,13 @@ Runs natively on **macOS, Linux, and Windows** (PowerShell / `cmd.exe`). For ful
 
 ## Rules
 
-`infrarails` ships **10 rules** mapped to Articles 9 and 12. Each finding is one of: **PASS**, **FAIL**, **WARN**, **SKIP**, or **INCONCLUSIVE**.
+`infrarails` ships **11 rules** mapped to Articles 9 and 12. Each finding is one of: **PASS**, **FAIL**, **WARN**, **SKIP**, or **INCONCLUSIVE**.
 
 | Rule ID | Severity | Article | Check |
 |---|---|---|---|
 | `S-9.x.1` | FAIL | 9 | Bedrock Agents must have a versioned guardrail attached (Agent-attached only - raw `InvokeModel`/`Converse` SDK calls are application-layer and out of scope for static IaC scanning) |
 | `S-9.x.2` | WARN | 9 | When Bedrock is in use, at least one `aws_bedrock_guardrail` should be declared in the scanned Terraform |
+| `S-9.x.3` | WARN | 9, 15 | `aws_bedrock_guardrail` bodies must enforce both mandatory surfaces - a `PROMPT_ATTACK` prompt-injection filter and a harmful-content filter at `MEDIUM`/`HIGH`. PII (incl. `ANONYMIZE`), contextual grounding, and denied topics score as supporting context, never penalised on absence. AWS Bedrock Guardrails only |
 | `S-12.1.1` | FAIL | 12 | `aws_bedrock_model_invocation_logging_configuration` is declared when Bedrock is in use |
 | `S-12.1.2a` | WARN | 12 | CloudWatch log group has retention ≥ 180 days, or a forwarder is detected. Escalates to **FAIL** under `--strict-account-logging` when no subscription filter is found |
 | `S-12.1.2b` | FAIL | 12 | S3 log bucket lifecycle ≥ 180 days (FAIL < 180; WARN 180-364; PASS ≥ 365) |
@@ -112,9 +113,12 @@ The hardest part of static compliance scanning isn't matching resource types - i
 
 **Bedrock Guardrails - Agent-attached vs SDK runtime.**
 
-- `S-9.x.1` covers Agent attachment via `guardrail_configuration` on `aws_bedrockagent_agent`. It verifies `guardrail_identifier` is non-empty and `guardrail_version` is numbered (not `"DRAFT"`).
-- `S-9.x.2` is a weaker presence check - "is *any* guardrail declared anywhere?" - that WARNs rather than FAILs, since guardrails commonly live in a separate security stack.
-- Neither rule verifies SDK-level `guardrailIdentifier` parameters on `InvokeModel`/`Converse`. That's application code, not IaC, and is called out in both rules' remediation messages so a passing `S-9.x.1` is never read as covering SDK-driven workloads.
+The three guardrail rules form a **presence → attachment → body** progression - three angles on one concept, so a clean run means a guardrail exists, is wired to the agent, *and* actually blocks something:
+
+- `S-9.x.2` is the weakest presence check - "is *any* guardrail declared anywhere?" - that WARNs rather than FAILs, since guardrails commonly live in a separate security stack.
+- `S-9.x.1` covers Agent attachment via `guardrail_configuration` on `aws_bedrockagent_agent`. It verifies `guardrail_identifier` is non-empty and `guardrail_version` is numbered (not `"DRAFT"`). A guardrail attached *by reference* to a definition in scope now PASSes (the correct Terraform idiom); a reference to a guardrail not in the scanned tree WARNs ("may live in another stack").
+- `S-9.x.3` inspects the guardrail *body*: attaching a guardrail with every action set to `NONE` passes `S-9.x.1`/`S-9.x.2` but provides no control surface. It WARNs when either mandatory surface (a `PROMPT_ATTACK` filter, a harmful-content filter) is absent or permissive, and PASSes only when both block.
+- None of the three verify SDK-level `guardrailIdentifier` parameters on `InvokeModel`/`Converse`. That's application code, not IaC, and is called out in the rules' remediation messages so a passing `S-9.x.1` is never read as covering SDK-driven workloads.
 
 **Variables, locals, and data sources** are resolved when possible. The resolver returns one of three outcomes:
 

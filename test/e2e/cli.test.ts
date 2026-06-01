@@ -561,6 +561,72 @@ describeIf('CLI e2e', () => {
     });
   });
 
+  describe('S-9.x.3 hard-rails body inspection', () => {
+    const grDir = path.resolve(__dirname, '../fixtures/guardrail-bodies');
+
+    function hardRails(fixture: string, args = ''): Array<{ status: string; description: string }> {
+      const result = runCli(`${grDir}/${fixture} ${args} --format json`.trim());
+      const parsed = JSON.parse(result.stdout);
+      return parsed.findings.filter((f: { ruleId: string }) => f.ruleId === 'S-9.x.3');
+    }
+
+    it('empty-body → WARN (empty)', () => {
+      const [f] = hardRails('empty-body');
+      expect(f.status).toBe('WARN');
+      expect(f.description).toMatch(/no policy body/);
+    });
+
+    it('all-none → WARN', () => {
+      const [f] = hardRails('all-none');
+      expect(f.status).toBe('WARN');
+    });
+
+    it('both-mandatory-blocking → PASS', () => {
+      const [f] = hardRails('both-mandatory-blocking');
+      expect(f.status).toBe('PASS');
+    });
+
+    it('content-only-no-prompt-attack → WARN naming prompt injection', () => {
+      const [f] = hardRails('content-only-no-prompt-attack');
+      expect(f.status).toBe('WARN');
+      expect(f.description).toMatch(/prompt injection/);
+    });
+
+    it('prompt-attack-only-no-content → WARN naming the content gap', () => {
+      const [f] = hardRails('prompt-attack-only-no-content');
+      expect(f.status).toBe('WARN');
+      expect(f.description).toMatch(/harmful-content filter/);
+    });
+
+    it('pii-anonymize → PASS (ANONYMIZE counts as enforcing)', () => {
+      const [f] = hardRails('pii-anonymize');
+      expect(f.status).toBe('PASS');
+      expect(f.description).toMatch(/Also enforcing: PII/);
+    });
+
+    it('grounding-threshold-set → PASS with grounding enforcing', () => {
+      const [f] = hardRails('grounding-threshold-set');
+      expect(f.status).toBe('PASS');
+      expect(f.description).toMatch(/contextual grounding/);
+    });
+
+    it('dynamic-filters → INCONCLUSIVE', () => {
+      const [f] = hardRails('dynamic-filters');
+      expect(f.status).toBe('INCONCLUSIVE');
+    });
+
+    it('mixed-surfaces → one finding per guardrail; strong PASS names the attaching agent, weak WARN', () => {
+      const findings = hardRails('mixed-surfaces');
+      expect(findings).toHaveLength(2);
+      const strong = findings.find((f) => f.description.includes('aws_bedrock_guardrail.strong'))!;
+      const weak = findings.find((f) => f.description.includes('aws_bedrock_guardrail.weak'))!;
+      expect(strong.status).toBe('PASS');
+      expect(strong.description).toMatch(/attached to agent\(s\): support_bot/);
+      expect(strong.description).toMatch(/denied topic/);
+      expect(weak.status).toBe('WARN');
+    });
+  });
+
   describe('INCONCLUSIVE behaviour', () => {
     const inconclusiveDir = path.resolve(__dirname, '../fixtures/inconclusive');
 

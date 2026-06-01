@@ -8,6 +8,7 @@ import { cloudtrailRule } from './cloudtrail';
 import { remoteModuleWallRule } from './module-wall';
 import { agentGuardrailRule } from './agent-guardrail';
 import { guardrailPresenceRule } from './guardrail-presence';
+import { hardRailsRule } from './hard-rails';
 import { planDeletionsRule } from './plan-deletions';
 
 export const allRules: ScanRule[] = [
@@ -20,5 +21,6 @@ export const allRules: ScanRule[] = [
   remoteModuleWallRule,
   agentGuardrailRule,
   guardrailPresenceRule,
+  hardRailsRule,
   planDeletionsRule,
 ];

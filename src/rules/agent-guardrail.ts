@@ -1,6 +1,7 @@
 import { ScanRule, Finding, ParsedFile, ScanContext } from '../types';
 import { findResources, findResourceLine, getNestedValue } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
+import { buildGuardrailGraph, GuardrailLink } from '../utils/guardrail-graph';
 
 const REGULATORY_REFERENCE = 'EU AI Act Article 9 - Risk management system for high-risk AI systems';
 const NIST_REFERENCE =
@@ -41,7 +42,7 @@ export const agentGuardrailRule: ScanRule = {
   nistReference: NIST_REFERENCE,
   isoReference: ISO_REFERENCE,
 
-  run(files: ParsedFile[], _context: ScanContext): Finding[] {
+  run(files: ParsedFile[], context: ScanContext): Finding[] {
     const agents = findResources(files, 'aws_bedrockagent_agent');
 
     if (agents.length === 0) {
@@ -58,6 +59,13 @@ export const agentGuardrailRule: ScanRule = {
         },
       ];
     }
+
+    // Decision A: the agent<->guardrail reference graph lets a guardrail
+    // attached *by reference* (the correct Terraform idiom) resolve to a
+    // declared resource instead of being penalised as INCONCLUSIVE by the
+    // ${...} wrapper. Built with the overlay so references resolve against
+    // guardrails visible only via the plan (remote modules).
+    const graph = buildGuardrailGraph(files, context.planOverlay);
 
     return agents.map((agent) => {
       const line = findResourceLine(agent.rawHcl, 'aws_bedrockagent_agent', agent.name);
@@ -103,12 +111,41 @@ export const agentGuardrailRule: ScanRule = {
         };
       }
 
+      const link: GuardrailLink = graph.agentToGuardrail.get(agent.name) ?? { kind: 'unresolved' };
+
+      // Decision A: a guardrail attached by reference to a definition NOT in
+      // the scanned Terraform is a referential gap. WARN (not FAIL) - the
+      // guardrail genuinely may live in a separate platform/security stack,
+      // same reasoning as S-9.x.2.
+      if (link.kind === 'reference-external') {
+        return {
+          ruleId: this.id,
+          status: 'WARN' as const,
+          filePath: agent.filePath,
+          line,
+          description:
+            `Bedrock Agent "${agent.name}" attaches a guardrail by reference ` +
+            `(aws_bedrock_guardrail.${link.guardrail}) whose definition is not in the scanned ` +
+            `Terraform. It may live in a separate platform/security stack.`,
+          remediation:
+            'Scan the stack that declares aws_bedrock_guardrail.' +
+            `${link.guardrail}, or document the cross-stack arrangement. ` +
+            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+          regulatoryReference: REGULATORY_REFERENCE,
+          nistReference: NIST_REFERENCE,
+          isoReference: ISO_REFERENCE,
+        };
+      }
+
       // If guardrail_identifier or guardrail_version is expression-driven
       // (var/local/data/module reference), we cannot prove the attached
       // guardrail is a real, versioned resource. Report INCONCLUSIVE rather
       // than passing optimistically - this is the conservative-by-default
-      // behaviour the README promises.
-      const idUnresolved = isUnresolvedScalar(id);
+      // behaviour the README promises. A reference to a guardrail declared
+      // in scope is referentially resolved, so only an unresolved *version*
+      // keeps it INCONCLUSIVE (Decision A: the correct idiom no longer trips
+      // the ${...}-wrapper INCONCLUSIVE).
+      const idUnresolved = link.kind === 'declared' ? false : isUnresolvedScalar(id);
       const versionUnresolved = version !== undefined && isUnresolvedScalar(version);
       if (idUnresolved || versionUnresolved) {
         const fields: string[] = [];
@@ -151,12 +188,19 @@ export const agentGuardrailRule: ScanRule = {
         };
       }
 
+      // A literal ID/ARN passes on a numbered version, but it is opaque: a
+      // guardrail's guardrail_id is known-after-apply, so it cannot be mapped
+      // back to a declared aws_bedrock_guardrail without --plan.
+      const opaqueNote =
+        link.kind === 'literal'
+          ? ' (identifier is a literal ID/ARN - not mappable to a declared guardrail without --plan)'
+          : '';
       return {
         ruleId: this.id,
         status: 'PASS' as const,
         filePath: agent.filePath,
         line,
-        description: `Bedrock Agent "${agent.name}" has a versioned guardrail attached (version ${version}).`,
+        description: `Bedrock Agent "${agent.name}" has a versioned guardrail attached (version ${version})${opaqueNote}.`,
         remediation: '',
         regulatoryReference: REGULATORY_REFERENCE,
         nistReference: NIST_REFERENCE,

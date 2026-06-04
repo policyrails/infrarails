@@ -58,7 +58,8 @@ export const guardrailPresenceRule: ScanRule = {
   nistReference: NIST_REFERENCE,
   isoReference: ISO_REFERENCE,
 
-  run(files: ParsedFile[], _context: ScanContext): Finding[] {
+  run(files: ParsedFile[], context: ScanContext): Finding[] {
+    const overlay = context.planOverlay;
     // "Bedrock workload" = anything that suggests model invocation will happen.
     // Exclude guardrail types themselves so the check doesn't become circular
     // (a Terraform that declares only a guardrail and nothing else would
@@ -91,7 +92,11 @@ export const guardrailPresenceRule: ScanRule = {
       ];
     }
 
-    const guardrails = findResources(files, 'aws_bedrock_guardrail');
+    // Consult the plan overlay (as S-9.x.3 does) so guardrails declared inside
+    // modules - visible only in the plan, not the raw HCL of the scanned
+    // directory - are counted. Without it this rule reports a false "no guardrail
+    // declared" WARN while S-9.x.3 inspects the very same guardrail's body.
+    const guardrails = findResources(files, 'aws_bedrock_guardrail', overlay);
 
     if (guardrails.length === 0) {
       const signals: string[] = [];
@@ -102,11 +107,22 @@ export const guardrailPresenceRule: ScanRule = {
       if (vpc.length > 0) signals.push(`${vpc.length} VPC endpoint(s) to Bedrock`);
       if (dataSources.length > 0) signals.push(`${dataSources.length} Bedrock data source(s)`);
 
+      // Anchor the WARN to the Bedrock usage that triggered it, so the alert
+      // points the reviewer at the resource needing a guardrail rather than the
+      // repo root. Order mirrors the signals message above; all four helpers
+      // carry a real on-disk filePath (overlay is not threaded here).
+      const triggerPath =
+        directWorkload[0]?.filePath ??
+        iam[0]?.filePath ??
+        vpc[0]?.filePath ??
+        dataSources[0]?.filePath ??
+        '';
+
       return [
         {
           ruleId: this.id,
           status: 'WARN',
-          filePath: '',
+          filePath: triggerPath,
           description: `Bedrock usage detected (${signals.join(', ')}) but no aws_bedrock_guardrail resource is declared anywhere in the scanned Terraform.`,
           remediation: NO_GUARDRAIL_REMEDIATION,
           regulatoryReference: REGULATORY_REFERENCE,

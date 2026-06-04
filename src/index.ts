@@ -8,12 +8,15 @@ import { parsePlanFile } from './plan-parser';
 import { PlanOverlay } from './types';
 import { formatTerminal, formatJson, formatHtml, formatPdf, formatSarif } from './formatter';
 
+// Injected at build time by tsup from package.json (see tsup.config.ts).
+declare const __APP_VERSION__: string;
+
 const program = new Command();
 
 program
   .name('infrarails')
   .description('Scan Terraform HCL files for EU AI Act Article 12 compliance gaps')
-  .version('0.2.1')
+  .version(__APP_VERSION__)
   .argument('<directory>', 'Directory containing Terraform .tf files')
   .option(
     '-f, --format <format>',

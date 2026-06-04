@@ -6,20 +6,21 @@ import { isUnresolvedScalar } from '../utils/literal';
 const MIN_RETENTION_DAYS = 180;
 const RECOMMENDED_RETENTION_DAYS = 365;
 
-// Article 12(1) requires logs be retained for an "appropriate period to the
-// intended purpose" - no specific number is named in the regulation. The 180-day
-// floor and 365-day recommendation reflect the practical reality that high-risk
-// AI incidents (bias drift, hallucinated decisions, downstream-deployer audits
-// under Article 26, regulator queries under Article 72 post-market monitoring)
-// surface months - often quarters - after the originating event. This rationale
-// is surfaced in remediation messages so users understand the "why" behind a
-// number that the regulation itself leaves open.
+// Logs are generated under Article 12(1) and retained under Article 19(1), which
+// requires they be "kept for a period appropriate to the intended purpose of the
+// high-risk AI system, of at least six months." That six-month minimum is the basis
+// for the 180-day floor; the 365-day recommendation reflects the practical reality
+// that high-risk AI incidents (bias drift, hallucinated decisions, downstream-deployer
+// audits under Article 26, regulator queries under Article 72 post-market monitoring)
+// surface months - often quarters - after the originating event. This rationale is
+// surfaced in remediation messages so users understand the "why" behind the number.
 const RETENTION_RATIONALE =
-  'Article 12 requires logs retained for an "appropriate period to the intended ' +
-  'purpose" - no specific number is named, but bias drift, hallucinated decisions, ' +
-  'and downstream-deployer audits routinely surface months after the event. ' +
-  'Sub-180-day retention undermines post-market monitoring (Article 72) and ' +
-  'incident investigation; 365 days is the typical floor for production AI.';
+  'EU AI Act Art. 19(1) requires high-risk-system logs be kept "for a period ' +
+  'appropriate to the intended purpose ... of at least six months" - that six-month ' +
+  'minimum is the 180-day floor. Bias drift, hallucinated decisions, and ' +
+  'downstream-deployer audits surface months after the event, so sub-180-day ' +
+  'retention undermines post-market monitoring (Article 72) and incident ' +
+  'investigation; 365 days is the typical floor for production AI.';
 
 // A static IaC scan cannot prove what happens to logs after they leave the
 // account: forwarders to Datadog/Splunk/SIEM are usually owned by a platform
@@ -74,7 +75,7 @@ export const cwRetentionRule: ScanRule = {
   id: 'S-12.1.2a',
   description: 'CloudWatch log group retention - WARN-level (forwarders may satisfy retention out-of-repo)',
   severity: 'WARN',
-  regulatoryReference: 'EU AI Act Article 12(1) - Logs retained for appropriate period',
+  regulatoryReference: 'EU AI Act Article 19(1) - High-risk-system logs kept for an appropriate period, at least six months',
   nistReference: 'NIST AI RMF 1.0: MANAGE 4.1 (post-deployment monitoring plans); MANAGE 4.3 (incident communication to AI actors); MEASURE 3.2 (risk tracking across AI lifecycle)',
   isoReference: 'ISO/IEC 42001:2023 Annex A: A.6.2.8 (AI system event logs); A.6.2.6 (AI system operation and monitoring)',
 

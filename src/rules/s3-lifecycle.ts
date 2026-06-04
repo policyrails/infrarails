@@ -9,17 +9,18 @@ const RECOMMENDED_RETENTION_DAYS = 365;
 // the lifecycle and log-group thresholds are deliberately decoupled (one could
 // be loosened without the other).
 const RETENTION_RATIONALE =
-  'Article 12 requires logs retained for an "appropriate period to the intended ' +
-  'purpose" - no specific number is named, but bias drift, hallucinated decisions, ' +
-  'and downstream-deployer audits routinely surface months after the event. ' +
-  'Sub-180-day retention undermines post-market monitoring (Article 72) and ' +
-  'incident investigation; 365 days is the typical floor for production AI.';
+  'EU AI Act Art. 19(1) requires high-risk-system logs be kept "for a period ' +
+  'appropriate to the intended purpose ... of at least six months" - that six-month ' +
+  'minimum is the 180-day floor. Bias drift, hallucinated decisions, and ' +
+  'downstream-deployer audits surface months after the event, so sub-180-day ' +
+  'retention undermines post-market monitoring (Article 72) and incident ' +
+  'investigation; 365 days is the typical floor for production AI.';
 
 export const s3LifecycleRule: ScanRule = {
   id: 'S-12.1.2b',
   description: 'S3 log bucket must have lifecycle retention of at least 180 days',
   severity: 'FAIL',
-  regulatoryReference: 'EU AI Act Article 12(1) - Logs retained for appropriate period',
+  regulatoryReference: 'EU AI Act Article 19(1) - High-risk-system logs kept for an appropriate period, at least six months',
   nistReference: 'NIST AI RMF 1.0: MANAGE 4.1 (post-deployment monitoring plans); MANAGE 4.3 (incident communication to AI actors); MEASURE 3.2 (risk tracking across AI lifecycle)',
   isoReference: 'ISO/IEC 42001:2023 Annex A: A.6.2.8 (AI system event logs); A.6.2.6 (AI system operation and monitoring)',
 

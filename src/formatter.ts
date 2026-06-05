@@ -42,10 +42,32 @@ interface ParsedRef {
 function parseRef(s: string | undefined, kind: 'eu' | 'nist' | 'iso'): ParsedRef | null {
   if (!s) return null;
   if (kind === 'eu') {
-    // "EU AI Act Article 12(1) - Description"
-    const m = s.match(/^EU AI Act\s+(.+?)\s+-\s+(.+)$/);
-    if (!m) return { framework: 'EU AI Act', items: [{ id: s, desc: undefined }] };
-    return { framework: 'EU AI Act', items: [{ id: m[1].trim(), desc: m[2].trim() }] };
+    // EU strings cite one or more articles, in either a dash form or a
+    // paren form:
+    //   "EU AI Act Article 19(1) - <prose>; Article 15(5) - <prose>"
+    //   "EU AI Act Art. 9(2)(d) (<prose>); Art. 15(5) ¶3 (<prose>)"
+    // The article number itself carries parenthesised sub-paragraphs
+    // ("9(2)(d)", "15(5) ¶3"), so anchor the id on the leading article token
+    // and treat whatever follows - dash-led or paren-wrapped - as the tooltip
+    // prose. A dash *inside* that prose must not be mistaken for the id/desc
+    // separator: that mistake truncated multi-article citations to a mangled
+    // first fragment ("Art. 9(2)(d) (appropriate and targeted...") and silently
+    // dropped the remaining articles.
+    const body = s.replace(/^EU AI Act\s+/, '');
+    const items = body
+      .split(';')
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((cite) => {
+        const m = cite.match(/^(Art\.|Article)\s+(\d+(?:\([0-9a-z]+\))*(?:\s*¶\s*\d+)?)\s*(.*)$/s);
+        if (!m) return { id: cite, desc: undefined };
+        const id = `${m[1]} ${m[2]}`.replace(/\s+/g, ' ').trim();
+        let desc = m[3].trim();
+        if (desc.startsWith('- ')) desc = desc.slice(2).trim();
+        else if (desc.startsWith('(') && desc.endsWith(')')) desc = desc.slice(1, -1).trim();
+        return { id, desc: desc || undefined };
+      });
+    return { framework: 'EU AI Act', items };
   }
   // NIST/ISO share format: "<Framework>: <ID> (<desc>); <ID> (<desc>)"
   // Use the last ": " (colon-space) so we skip embedded version numbers like

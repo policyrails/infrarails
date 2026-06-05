@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { PlanOverlay, PlanResource, PlanDeletion } from './types';
+import { PlanOverlay, PlanResource, PlanDeletion, ConfigReferenceGraph } from './types';
 
 /**
  * Parse a `terraform show -json plan.bin` JSON document into a PlanOverlay.
@@ -175,6 +175,11 @@ export function parsePlanObject(parsed: unknown): PlanOverlay {
     noActionableChanges = !anyActioned;
   }
 
+  // 4. configuration - reference graph (edges, not values). Survives
+  // known-after-apply because it records what an attribute *references*, not
+  // what it resolves to. Absent block -> undefined (callers tolerate it).
+  const configReferences = parseConfigReferences(plan.configuration);
+
   return {
     formatVersion,
     terraformVersion,
@@ -184,7 +189,179 @@ export function parsePlanObject(parsed: unknown): PlanOverlay {
     flags: { noActionableChanges },
     variables,
     outputs,
+    configReferences,
   };
+}
+
+// --- configuration reference graph -----------------------------------------
+
+// Resource reference: aws_<type>.<name>[.attr][index] - we keep only the leaf
+// type.name (the terminal we trace toward).
+const CFG_RES_REF = /^(aws_[a-z0-9_]+)\.([a-z_][a-z0-9_-]*)/i;
+// Module-output reference: module.<name>.<output> (single- or nested-module),
+// with optional `[...]` indices. Bare `module.<name>` (no trailing segment) is
+// intentionally excluded - it carries no output and is noise in the references
+// array Terraform emits alongside the real edge.
+const CFG_MODULE_REF = /^(?:module\.[a-z0-9_]+(?:\[[^\]]+\])?\.)+\w+$/i;
+// Variable reference: var.<name> with optional chained `.field` / `[N]`.
+const CFG_VAR_REF = /^var\.([a-z0-9_]+(?:\.[a-z0-9_]+|\[\d+\])*)$/i;
+
+/**
+ * Distil the plan `configuration` block into a pre-qualified reference graph.
+ * Walks the root module and every nested `module_calls` entry, recording three
+ * edge kinds (resource-attribute, module-output, call-site variable binding)
+ * with all references resolved to qualified nodes (see ConfigReferenceGraph).
+ *
+ * Returns undefined when no usable configuration block is present.
+ */
+function parseConfigReferences(configuration: unknown): ConfigReferenceGraph | undefined {
+  if (!configuration || typeof configuration !== 'object') return undefined;
+  const rootModule = (configuration as Record<string, unknown>).root_module;
+  if (!rootModule || typeof rootModule !== 'object') return undefined;
+
+  const graph: ConfigReferenceGraph = {
+    resourceAttrs: new Map(),
+    moduleOutputs: new Map(),
+    varBindings: new Map(),
+  };
+  walkConfigModule(rootModule as Record<string, unknown>, '', graph);
+
+  const empty =
+    graph.resourceAttrs.size === 0 &&
+    graph.moduleOutputs.size === 0 &&
+    graph.varBindings.size === 0;
+  return empty ? undefined : graph;
+}
+
+function walkConfigModule(
+  mod: Record<string, unknown>,
+  modulePath: string,
+  graph: ConfigReferenceGraph,
+): void {
+  // (a) resources: record qualified references per top-level attribute.
+  const resources = mod.resources;
+  if (Array.isArray(resources)) {
+    for (const r of resources) {
+      if (!r || typeof r !== 'object') continue;
+      const rec = r as Record<string, unknown>;
+      const relAddress = stripIndices(stringOr(rec.address, ''));
+      if (!relAddress) continue;
+      const fullAddress = modulePath ? `${modulePath}.${relAddress}` : relAddress;
+      const expressions = rec.expressions;
+      if (!expressions || typeof expressions !== 'object') continue;
+      for (const [attr, expr] of Object.entries(expressions as Record<string, unknown>)) {
+        const refs = qualifyAll(collectReferences(expr), modulePath);
+        if (refs.length > 0) graph.resourceAttrs.set(`${fullAddress}#${attr}`, refs);
+      }
+    }
+  }
+
+  // (b) outputs: an output's value references, qualified in this module's scope.
+  // Root outputs (modulePath === '') are never referenced via `module.X.Y`, so
+  // skip them - they would key as ".<name>" and never be looked up.
+  const outputs = mod.outputs;
+  if (modulePath && outputs && typeof outputs === 'object') {
+    for (const [name, entry] of Object.entries(outputs as Record<string, unknown>)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const expr = (entry as Record<string, unknown>).expression;
+      const refs = qualifyAll(collectReferences(expr), modulePath);
+      if (refs.length > 0) graph.moduleOutputs.set(`${modulePath}.${name}`, refs);
+    }
+  }
+
+  // (c) module_calls: bind each input variable to its call-site references
+  // (resolved in THIS module's scope), then recurse into the child module.
+  const moduleCalls = mod.module_calls;
+  if (moduleCalls && typeof moduleCalls === 'object') {
+    for (const [callName, callBody] of Object.entries(moduleCalls as Record<string, unknown>)) {
+      if (!callBody || typeof callBody !== 'object') continue;
+      const call = callBody as Record<string, unknown>;
+      const childPath = modulePath ? `${modulePath}.module.${callName}` : `module.${callName}`;
+
+      const callExprs = call.expressions;
+      if (callExprs && typeof callExprs === 'object') {
+        for (const [input, expr] of Object.entries(callExprs as Record<string, unknown>)) {
+          const refs = qualifyAll(collectReferences(expr), modulePath);
+          if (refs.length > 0) graph.varBindings.set(`${childPath}::${input}`, refs);
+        }
+      }
+
+      const childModule = call.module;
+      if (childModule && typeof childModule === 'object') {
+        walkConfigModule(childModule as Record<string, unknown>, childPath, graph);
+      }
+    }
+  }
+}
+
+/**
+ * Recursively gather every reference string under a configuration expression.
+ * Handles both the flat `{ references: [...] }` form and nested-block forms
+ * (objects / arrays of sub-expressions), so a block whose attributes carry
+ * their own references is fully collected.
+ */
+function collectReferences(expr: unknown): string[] {
+  const out: string[] = [];
+  const visit = (v: unknown): void => {
+    if (!v) return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    if (typeof v !== 'object') return;
+    const rec = v as Record<string, unknown>;
+    if (Array.isArray(rec.references)) {
+      for (const ref of rec.references) {
+        if (typeof ref === 'string') out.push(ref);
+      }
+    }
+    for (const [k, val] of Object.entries(rec)) {
+      if (k === 'references' || k === 'constant_value') continue;
+      visit(val);
+    }
+  };
+  visit(expr);
+  return out;
+}
+
+// Qualify raw configuration references (relative to `modulePath`) into the
+// tagged-node vocabulary; drop refs that are not part of a resource/output/var
+// chain (locals, data sources, count.index, etc.).
+function qualifyAll(refs: string[], modulePath: string): string[] {
+  const out = new Set<string>();
+  for (const ref of refs) {
+    const node = qualifyReference(ref, modulePath);
+    if (node) out.add(node);
+  }
+  return [...out];
+}
+
+function qualifyReference(ref: string, modulePath: string): string | undefined {
+  const resMatch = ref.match(CFG_RES_REF);
+  if (resMatch) return `res:${resMatch[1]}.${resMatch[2]}`;
+
+  const noIdx = ref.replace(/\[[^\]]*\]/g, '');
+  if (CFG_MODULE_REF.test(noIdx)) {
+    const full = modulePath ? `${modulePath}.${noIdx}` : noIdx;
+    return `out:${full}`;
+  }
+
+  const varMatch = ref.match(CFG_VAR_REF);
+  if (varMatch) {
+    // Reduce to the base input name. A module input is bound at the call site
+    // by name, so an object/collection input accessed by attribute or index
+    // (var.config.guardrail_id, var.ids[0]) must still key to that input. The
+    // suffix selects into the bound value, which the walk over-approximates by
+    // following all of the input's references.
+    const base = varMatch[1].split(/[.[]/)[0];
+    return `var:${modulePath}::${base}`;
+  }
+
+  return undefined;
+}
+
+function stripIndices(address: string): string {
+  return address.replace(/\[[^\]]*\]/g, '');
 }
 
 function walkModule(

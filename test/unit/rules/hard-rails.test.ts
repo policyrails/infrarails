@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { hardRailsRule } from '../../../src/rules/hard-rails';
 import { runScan } from '../../../src/runner';
 import { emptyContext, emptyPlanOverlay } from './helpers';
+import { parsePlanObject } from '../../../src/plan-parser';
 import { ParsedFile, HCL2JSONOutput } from '../../../src/types';
 
 // --- builders for the hcl2json guardrail body shape ------------------------
@@ -85,12 +86,18 @@ describe('S-9.x.3 hard-rails enforcement', () => {
     const findings = run([grFile(merge(contentPolicy(paFilter('HIGH'))))]);
     expect(findings[0].status).toBe('WARN');
     expect(findings[0].description).toContain('no harmful-content filter declared');
+    expect(findings[0].description).toContain(
+      'The other mandatory surface is enforcing: the PROMPT_ATTACK prompt-injection filter',
+    );
   });
 
   it('WARNs (mandatory gap) when a harmful-content filter blocks but no PROMPT_ATTACK filter', () => {
     const findings = run([grFile(merge(contentPolicy(harmfulFilter('HATE', 'HIGH', 'HIGH'))))]);
     expect(findings[0].status).toBe('WARN');
     expect(findings[0].description).toContain('prompt injection uncontrolled');
+    expect(findings[0].description).toContain(
+      'The other mandatory surface is enforcing: a harmful-content filter (MEDIUM+)',
+    );
   });
 
   it('WARNs when every filter (incl. PROMPT_ATTACK) is set to NONE', () => {
@@ -213,6 +220,40 @@ describe('S-9.x.3 hard-rails enforcement', () => {
     expect(byName('content_only')!.status).toBe('WARN');
   });
 
+  it('does not emit the guardrail twice when scanned as both HCL and plan instance', () => {
+    // Reproduces the reported duplicate: a guardrail in a local module is walked
+    // from disk (aws_bedrock_guardrail.recruiter) and also surfaced by the plan
+    // overlay (module.bedrock_governance.aws_bedrock_guardrail.recruiter). It is
+    // one resource and must yield one finding, attributed to the HCL copy.
+    const overlay = parsePlanObject({
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      planned_values: {
+        root_module: {
+          child_modules: [
+            {
+              address: 'module.bedrock_governance',
+              resources: [
+                {
+                  address: 'module.bedrock_governance.aws_bedrock_guardrail.recruiter',
+                  type: 'aws_bedrock_guardrail',
+                  name: 'recruiter',
+                  values: bothMandatoryBlocking(),
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    const findings = run(
+      [grFile(bothMandatoryBlocking(), undefined, 'recruiter')],
+      emptyContext({ planOverlay: overlay }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].filePath).toBe('test.tf');
+  });
+
   describe('Decision B/C - attaching-agent enrichment', () => {
     it('names attaching agents (blast radius) in the finding', () => {
       const file: ParsedFile = {
@@ -253,5 +294,77 @@ describe('S-9.x.3 hard-rails enforcement', () => {
       const gr = findings.find((f) => f.ruleId === 'S-9.x.3')!;
       expect(gr.status).toBe('FAIL');
     });
+  });
+});
+
+describe('S-9.x.3 attaching-agent enrichment via plan configuration', () => {
+  // Agent (module recruiter_api) attaches the HCL guardrail "recruiter" through
+  // a cross-module var/output chain that the plan configuration graph resolves.
+  function overlayAttachingRecruiter() {
+    return parsePlanObject({
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      planned_values: {
+        root_module: {
+          child_modules: [
+            {
+              address: 'module.recruiter_api',
+              resources: [
+                {
+                  address: 'module.recruiter_api.aws_bedrockagent_agent.recruiter',
+                  type: 'aws_bedrockagent_agent',
+                  name: 'recruiter',
+                  values: { guardrail_configuration: [{}] },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      configuration: {
+        root_module: {
+          module_calls: {
+            recruiter_api: {
+              expressions: {
+                guardrail_identifier: { references: ['module.bedrock_governance.guardrail_identifier'] },
+              },
+              module: {
+                resources: [
+                  {
+                    address: 'aws_bedrockagent_agent.recruiter',
+                    type: 'aws_bedrockagent_agent',
+                    name: 'recruiter',
+                    expressions: {
+                      guardrail_configuration: { references: ['var.guardrail_identifier'] },
+                    },
+                  },
+                ],
+              },
+            },
+            bedrock_governance: {
+              expressions: {},
+              module: {
+                outputs: {
+                  guardrail_identifier: {
+                    expression: { references: ['aws_bedrock_guardrail.recruiter.guardrail_arn'] },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  it('labels the guardrail as attached (drops the "Not attached" note)', () => {
+    const findings = run(
+      [grFile(bothMandatoryBlocking(), undefined, 'recruiter')],
+      emptyContext({ planOverlay: overlayAttachingRecruiter() }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].status).toBe('PASS');
+    expect(findings[0].description).toContain('attached to agent(s): recruiter');
+    expect(findings[0].description).not.toContain('Not attached to any Bedrock Agent');
   });
 });

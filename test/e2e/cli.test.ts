@@ -382,23 +382,58 @@ describeIf('CLI e2e', () => {
       expect(withPlan.exitCode).toBe(0);
     });
 
-    it('computed-bucket: bucket marked after_unknown stays INCONCLUSIVE (plan-known-after-apply), not FAIL', () => {
+    it('computed-bucket: bucket name after_unknown still anchors on the HCL resource identity, so S3 checks run (no spurious FAIL/INCONCLUSIVE)', () => {
       const result = runCli(
         `${planDir}/computed-bucket --plan ${planDir}/computed-bucket/plan.json --format json`,
       );
       const parsed = JSON.parse(result.stdout);
-      const matched = parsed.findings.filter((f: { description: string }) =>
-        /known at apply time|after_unknown|computed at apply/i.test(
-          f.description,
-        ),
+      // The bucket NAME is computed-at-apply (after_unknown), but the reference
+      // aws_s3_bucket.logs.bucket names a resource that IS declared in the
+      // scanned HCL. We anchor on that identity rather than giving up, so the
+      // bucket-scoped rules resolve to aws_s3_bucket.logs and run against the
+      // (compliant) supporting resources instead of going INCONCLUSIVE.
+      const bucketScoped = parsed.findings.filter((f: { ruleId: string }) =>
+        ['S-12.x.1', 'S-12.x.2a', 'S-12.1.2b'].includes(f.ruleId),
       );
-      expect(matched.length).toBeGreaterThan(0);
-      // No spurious FAIL from comparing null against the rule expectation
-      const fails = parsed.findings.filter(
+      expect(bucketScoped.length).toBe(3);
+      for (const f of bucketScoped) {
+        expect(f.status).toBe('PASS');
+        expect(f.description).toMatch(/aws_s3_bucket\.logs/);
+      }
+      // Original protection retained: a computed-at-apply value must never
+      // produce a spurious FAIL or INCONCLUSIVE for the bucket.
+      const badBucket = parsed.findings.filter(
         (f: { status: string; description: string }) =>
-          f.status === 'FAIL' && /bucket/i.test(f.description),
+          (f.status === 'FAIL' || f.status === 'INCONCLUSIVE') &&
+          /bucket/i.test(f.description),
       );
-      expect(fails.length).toBe(0);
+      expect(badBucket.length).toBe(0);
+    });
+
+    it('module-computed-bucket: bucket name dropped from a module-buried plan body still resolves via HCL, so S3 checks run and a 90-day lifecycle FAILs (not a false "does not use S3" skip)', () => {
+      const result = runCli(
+        `${planDir}/module-computed-bucket --plan ${planDir}/module-computed-bucket/plan.json --format json`,
+      );
+      const parsed = JSON.parse(result.stdout);
+      const byId = (id: string) =>
+        parsed.findings.find((f: { ruleId: string }) => f.ruleId === id);
+
+      // Regression guard: the plan's module-buried logging config omits
+      // s3_config.bucket_name (computed-at-apply), but the on-disk module HCL
+      // still names the bucket, so we must NOT conclude "does not use S3".
+      const skippedAsNoS3 = parsed.findings.filter((f: { description: string }) =>
+        /does not use S3/i.test(f.description),
+      );
+      expect(skippedAsNoS3.length).toBe(0);
+
+      // Identity anchored on HCL → bucket-scoped checks run against the bucket.
+      expect(byId('S-12.x.1').status).toBe('PASS'); // versioning Enabled
+      expect(byId('S-12.x.2a').status).toBe('PASS'); // KMS encryption
+      // Plan resolves expiration.days = 90, below the 180-day Art. 19(1) floor.
+      const lifecycle = byId('S-12.1.2b');
+      expect(lifecycle.status).toBe('FAIL');
+      expect(lifecycle.description).toMatch(/90 days/);
+      expect(lifecycle.description).toMatch(/aws_s3_bucket\.logs/);
     });
 
     it('deletion-of-logging: destroying the bedrock logging config emits a FAIL', () => {

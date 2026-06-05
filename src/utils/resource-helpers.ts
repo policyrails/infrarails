@@ -1,4 +1,5 @@
-import { Finding, ParsedFile, PlanOverlay, ScanRule, UnresolvedRef } from '../types';
+import * as path from 'path';
+import { Finding, ParsedFile, PlanOverlay, PlanResource, ScanRule, UnresolvedRef } from '../types';
 import { explainReason, resolveExpression } from '../resolver';
 
 /**
@@ -42,18 +43,45 @@ export interface FoundResource {
    * source is 'plan'. Undefined for HCL-sourced resources.
    */
   address?: string;
+  /**
+   * For a module-buried plan instance folded with an on-disk HCL block, the HCL
+   * body of that block. Lets value extraction fall back to the HCL reference
+   * when the plan dropped an attribute it marked computed-at-apply-time (e.g. a
+   * bucket name built from the account id is absent from planned_values). The
+   * HCL reference still names the resource, so we can anchor on it. Undefined
+   * for HCL-sourced and genuinely plan-only (remote-module) resources.
+   */
+  hclBody?: Record<string, unknown>;
 }
 
 /**
  * Find all resources of a given type across all parsed files - and, when
- * `overlay` is provided, also surface resources of that type from the plan.
+ * `overlay` is provided, reconcile them against the plan so every logical
+ * resource is returned exactly once.
  *
- * HCL entries win when both HCL and overlay have a resource with the same
- * `{type, name}`; plan-only entries (resources buried inside remote modules)
- * are appended. This unlocks rule evaluation against resources the static
- * scanner would otherwise be blind to.
+ * Reconciliation (one entry per logical resource, never a duplicate):
+ *   - Each plan resource is keyed by its *index-stripped* address, so the
+ *     several instances of a count/for_each resource collapse to one entry
+ *     while distinct module calls (`module.a.x` vs `module.b.x`) stay separate.
+ *   - A root-level plan resource declared in HCL is dropped in favour of the
+ *     HCL block (which carries a real source line).
+ *   - A module-buried plan resource that matches an on-disk HCL block (a local
+ *     module walked from the scan root) is *folded* together with it: the plan
+ *     instance is kept - it carries the resolved body and the full address the
+ *     guardrail graph needs - but it borrows the HCL block's file path and raw
+ *     source so the finding keeps a real file:line attribution, and that exact
+ *     HCL block is dropped so the resource is not emitted twice. The match is
+ *     by module *directory* (resolved from local module sources), never by leaf
+ *     name, so two resources that share a name across modules (the ubiquitous
+ *     `this`) are not conflated. See pickHclForInstance / buildDirPlanPathIndex.
+ *   - A genuinely plan-only resource (e.g. buried in a remote module not on
+ *     disk) has no HCL match and is returned as-is.
  *
- * `filePath` on plan-only entries is `plan:<full-plan-address>` so findings
+ * Invariant (CLAUDE.md "HCL-anchored resolution"): supplying a plan never
+ * removes a resource a source-only scan would have seen. Only the *exact* HCL
+ * block consumed by a fold is dropped; an unrelated same-named block is kept.
+ *
+ * `filePath` on a plan-only entry is `plan:<full-plan-address>` so findings
  * stay attributable in audit reports even when no HCL line exists.
  */
 export function findResources(
@@ -63,6 +91,10 @@ export function findResources(
 ): FoundResource[] {
   const results: FoundResource[] = [];
   const hclAddresses = new Set<string>();
+  // Leaf name -> every HCL block with that name. A list (not a single entry)
+  // because the same leaf name legitimately recurs across modules (the `this`
+  // convention); collapsing to one would lose blocks and misattribute folds.
+  const hclByName = new Map<string, FoundResource[]>();
 
   for (const file of files) {
     const typeBlock = file.json.resource?.[resourceType];
@@ -70,50 +102,204 @@ export function findResources(
 
     for (const [name, bodies] of Object.entries(typeBlock)) {
       const body = Array.isArray(bodies) ? bodies[0] : bodies;
-      results.push({
+      const entry: FoundResource = {
         name,
         body: body as Record<string, unknown>,
         filePath: file.filePath,
         rawHcl: file.rawHcl,
         source: 'hcl',
-      });
+      };
+      results.push(entry);
       hclAddresses.add(`${resourceType}.${name}`);
+      const list = hclByName.get(name);
+      if (list) list.push(entry);
+      else hclByName.set(name, [entry]);
     }
   }
 
-  if (overlay) {
-    // Iterate per-instance (count/for_each yield multiple PlanResource records
-    // under one normalised key). Dedup against HCL by normalised address so
-    // hcl-defined multi-instance resources do not get double-counted: the HCL
-    // block wins, plan instances are skipped. Plan-only resources (e.g. those
-    // buried in remote modules) are appended in full so rules see every
-    // instance and can emit per-instance findings.
-    const instanceLists = overlay.instancesByNormalised
-      ? Array.from(overlay.instancesByNormalised.values())
-      : [Array.from(overlay.resources.values())];
-    for (const list of instanceLists) {
-      for (const planRes of list) {
-        if (planRes.type !== resourceType) continue;
-        // Only suppress *root-level* plan duplicates of HCL resources. Plan
-        // resources buried under a `module.X.` prefix are kept even if their
-        // leaf `<type>.<name>` collides with a root-level HCL block: they are
-        // distinct resources living inside a separate module instance.
-        const isRoot = !planRes.address.startsWith('module.');
-        const rootKey = planRes.address.replace(/\[[^\]]*\]/g, '');
-        if (isRoot && hclAddresses.has(rootKey)) continue;
-        results.push({
-          name: planRes.name,
-          body: planRes.values as Record<string, unknown>,
-          filePath: `plan:${planRes.address}`,
-          rawHcl: '',
-          source: 'plan',
-          address: planRes.address,
-        });
+  if (!overlay) return results;
+
+  // count/for_each yield multiple PlanResource records under one normalised
+  // key; iterate every instance so we can collapse them deliberately below.
+  const instanceLists = overlay.instancesByNormalised
+    ? Array.from(overlay.instancesByNormalised.values())
+    : [Array.from(overlay.resources.values())];
+
+  // Map each scanned file's directory to the Terraform module path it
+  // represents, so a module-buried plan instance can be paired with the
+  // *correct* on-disk HCL block. Leaf-name matching alone conflates distinct
+  // resources that share a name across modules (the ubiquitous `this`).
+  const dirPlanPath = buildDirPlanPathIndex(files);
+
+  // Leaf names of root-level (non-module) plan resources of this type. A root
+  // resource's HCL block must never be folded into a module instance that
+  // merely shares its leaf name. Pre-computed because root and module
+  // instances are interleaved across the lists.
+  const rootPlanNames = new Set<string>();
+  for (const list of instanceLists) {
+    for (const planRes of list) {
+      if (planRes.type === resourceType && !planRes.address.startsWith('module.')) {
+        rootPlanNames.add(planRes.name);
       }
     }
   }
 
-  return results;
+  const seenInstances = new Set<string>(); // index-stripped full addresses
+  const foldedHcl = new Set<FoundResource>(); // the exact HCL blocks consumed by a fold
+
+  for (const list of instanceLists) {
+    for (const planRes of list) {
+      if (planRes.type !== resourceType) continue;
+      // Collapse count/for_each (same address sans index) to one entry while
+      // keeping distinct module calls (different module path) apart.
+      const instanceKey = planRes.address.replace(/\[[^\]]*\]/g, '');
+      if (seenInstances.has(instanceKey)) continue;
+      seenInstances.add(instanceKey);
+
+      const planEntry: FoundResource = {
+        name: planRes.name,
+        body: planRes.values as Record<string, unknown>,
+        filePath: `plan:${planRes.address}`,
+        rawHcl: '',
+        source: 'plan',
+        address: planRes.address,
+      };
+
+      if (!planRes.address.startsWith('module.')) {
+        // A root resource declared in HCL wins (keeps its source line).
+        if (hclAddresses.has(instanceKey)) continue;
+        results.push(planEntry);
+        continue;
+      }
+
+      // Module-buried instance. Fold it with the on-disk HCL block for *this*
+      // instance (matched by module directory, not leaf name) so the finding
+      // keeps a real file:line; that exact block is dropped below.
+      const hcl = pickHclForInstance(
+        planRes.address,
+        planRes.type,
+        planRes.name,
+        hclByName,
+        foldedHcl,
+        dirPlanPath,
+        rootPlanNames,
+      );
+      if (hcl) {
+        planEntry.filePath = hcl.filePath;
+        planEntry.rawHcl = hcl.rawHcl;
+        planEntry.hclBody = hcl.body;
+        foldedHcl.add(hcl);
+      }
+      results.push(planEntry);
+    }
+  }
+
+  // Drop exactly the HCL blocks that were folded into a plan instance - nothing
+  // else. Keying the drop on object identity (not leaf name) guarantees an
+  // unrelated same-named resource is never removed: supplying a plan can never
+  // make a resource disappear that a source-only scan would have seen.
+  return foldedHcl.size === 0 ? results : results.filter((r) => !foldedHcl.has(r));
+}
+
+/**
+ * Choose the on-disk HCL block that corresponds to one specific module-buried
+ * plan instance. Pairing is by module *directory* (resolved from local module
+ * sources), never by leaf name, so distinct same-named resources are not
+ * conflated.
+ *
+ * Decision order:
+ *   1. The candidate whose own module path equals the instance's module path
+ *      (the precise, fully-wired case). Exactly one -> use it.
+ *   2. Fallback for a local module scanned without its caller (its directory
+ *      maps to '' because no `module {}` edge reaches it): a single, unclaimed
+ *      candidate that is not a known root resource. This preserves the common
+ *      "scan a module subtree directly" case.
+ *   3. Otherwise undefined: leave the plan instance plan-only and drop nothing.
+ *      A duplicate is acceptable; a wrong fold or a dropped resource is not.
+ */
+function pickHclForInstance(
+  address: string,
+  type: string,
+  name: string,
+  hclByName: Map<string, FoundResource[]>,
+  foldedHcl: Set<FoundResource>,
+  dirPlanPath: Map<string, string>,
+  rootPlanNames: Set<string>,
+): FoundResource | undefined {
+  const candidates = (hclByName.get(name) ?? []).filter((c) => !foldedHcl.has(c));
+  if (candidates.length === 0) return undefined;
+
+  const idxStripped = address.replace(/\[[^\]]*\]/g, '');
+  const suffix = `.${type}.${name}`;
+  const modulePath = idxStripped.endsWith(suffix)
+    ? idxStripped.slice(0, -suffix.length)
+    : '';
+
+  const planPathOf = (c: FoundResource): string =>
+    dirPlanPath.get(path.resolve(path.dirname(c.filePath))) ?? '';
+
+  const exact = candidates.filter((c) => planPathOf(c) === modulePath);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return undefined; // genuinely ambiguous - do not guess
+
+  // No directory-precise match. Fold only the unambiguous standalone case.
+  if (
+    candidates.length === 1 &&
+    planPathOf(candidates[0]) === '' &&
+    !rootPlanNames.has(name)
+  ) {
+    return candidates[0];
+  }
+  return undefined;
+}
+
+/**
+ * Map each scanned file's directory (absolute) to the Terraform module path it
+ * represents - `modules/eu` -> `module.eu`, nested -> `module.a.module.b` - by
+ * walking local `module { source = "./..." }` declarations. A directory with no
+ * incoming local-module edge maps to '' (the root module, or a standalone
+ * module directory scanned without its caller). Remote-module sources have no
+ * on-disk directory and never appear.
+ */
+function buildDirPlanPathIndex(files: ParsedFile[]): Map<string, string> {
+  // childDir -> { parentDir, moduleCallName } for every local module block.
+  type ModuleEdge = { parentDir: string; name: string };
+  const parentEdge = new Map<string, ModuleEdge>();
+  for (const file of files) {
+    const moduleBlocks = file.json.module;
+    if (!moduleBlocks) continue;
+    const declaringDir = path.resolve(path.dirname(file.filePath));
+    for (const [callName, bodies] of Object.entries(moduleBlocks)) {
+      const body = Array.isArray(bodies) ? bodies[0] : bodies;
+      const source = (body as Record<string, unknown>)?.source;
+      if (typeof source !== 'string') continue;
+      if (!source.startsWith('./') && !source.startsWith('../')) continue; // remote
+      parentEdge.set(path.resolve(declaringDir, source), {
+        parentDir: declaringDir,
+        name: callName,
+      });
+    }
+  }
+
+  const planPathOf = (dir: string): string => {
+    const parts: string[] = [];
+    const guard = new Set<string>(); // cycle guard for pathological inputs
+    let cur: string | undefined = dir;
+    while (cur && parentEdge.has(cur) && !guard.has(cur)) {
+      guard.add(cur);
+      const edge: ModuleEdge = parentEdge.get(cur)!;
+      parts.unshift(`module.${edge.name}`);
+      cur = edge.parentDir;
+    }
+    return parts.join('.');
+  };
+
+  const out = new Map<string, string>();
+  for (const file of files) {
+    const dir = path.resolve(path.dirname(file.filePath));
+    if (!out.has(dir)) out.set(dir, planPathOf(dir));
+  }
+  return out;
 }
 
 /**

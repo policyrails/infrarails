@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildGuardrailGraph } from '../../src/utils/guardrail-graph';
+import { parsePlanObject } from '../../src/plan-parser';
 import { makeParsedFile } from './rules/helpers';
 
 // hcl2json emits a resource reference like
@@ -124,5 +125,277 @@ describe('buildGuardrailGraph', () => {
 
     expect(agentToGuardrail.size).toBe(0);
     expect(guardrailToAgents.size).toBe(0);
+  });
+});
+
+describe('buildGuardrailGraph - cross-module resolution via plan configuration', () => {
+  // Agent (module recruiter_api) attaches a guardrail (module bedrock_governance)
+  // whose identifier/version are known-after-apply, plumbed through module
+  // outputs. Only the configuration reference graph can prove this.
+  function crossModulePlan(opts?: { breakChain?: boolean; draftVersion?: boolean }) {
+    const idOutputRefs = opts?.breakChain
+      ? ['aws_bedrock_guardrail.somewhere_else.guardrail_arn']
+      : ['aws_bedrock_guardrail.recruiter.guardrail_arn'];
+    const versionOutput = opts?.draftVersion
+      ? { expression: { constant_value: 'DRAFT' } }
+      : { expression: { references: ['aws_bedrock_guardrail_version.recruiter.version'] } };
+    return {
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      planned_values: {
+        root_module: {
+          child_modules: [
+            {
+              address: 'module.bedrock_governance',
+              resources: [
+                {
+                  address: 'module.bedrock_governance.aws_bedrock_guardrail.recruiter',
+                  type: 'aws_bedrock_guardrail',
+                  name: 'recruiter',
+                  values: {},
+                },
+              ],
+            },
+            {
+              address: 'module.recruiter_api',
+              resources: [
+                {
+                  address: 'module.recruiter_api.aws_bedrockagent_agent.recruiter',
+                  type: 'aws_bedrockagent_agent',
+                  name: 'recruiter',
+                  values: { guardrail_configuration: [{}] },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      configuration: {
+        root_module: {
+          module_calls: {
+            recruiter_api: {
+              expressions: {
+                guardrail_identifier: {
+                  references: ['module.bedrock_governance.guardrail_identifier'],
+                },
+                guardrail_version: {
+                  references: ['module.bedrock_governance.guardrail_version'],
+                },
+              },
+              module: {
+                resources: [
+                  {
+                    address: 'aws_bedrockagent_agent.recruiter',
+                    type: 'aws_bedrockagent_agent',
+                    name: 'recruiter',
+                    expressions: {
+                      guardrail_configuration: {
+                        references: ['var.guardrail_identifier', 'var.guardrail_version'],
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+            bedrock_governance: {
+              expressions: {},
+              module: {
+                outputs: {
+                  guardrail_identifier: { expression: { references: idOutputRefs } },
+                  guardrail_version: versionOutput,
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  it('resolves a known-after-apply identifier to a declared-via-module link', () => {
+    const overlay = parsePlanObject(crossModulePlan());
+    const { agentToGuardrail, guardrailToAgents } = buildGuardrailGraph([], overlay);
+
+    expect(agentToGuardrail.get('recruiter')).toEqual({
+      kind: 'declared-via-module',
+      guardrail: 'recruiter',
+      versionPin: 'versioned',
+    });
+    expect(guardrailToAgents.get('recruiter')).toEqual(['recruiter']);
+  });
+
+  it('reports versionPin "unknown" when the chain reaches no guardrail_version resource', () => {
+    const overlay = parsePlanObject(crossModulePlan({ draftVersion: true }));
+    const { agentToGuardrail } = buildGuardrailGraph([], overlay);
+    expect(agentToGuardrail.get('recruiter')).toEqual({
+      kind: 'declared-via-module',
+      guardrail: 'recruiter',
+      versionPin: 'unknown',
+    });
+  });
+
+  it('does not record an edge when the chain ends at a guardrail not in scope', () => {
+    const overlay = parsePlanObject(crossModulePlan({ breakChain: true }));
+    const { agentToGuardrail, guardrailToAgents } = buildGuardrailGraph([], overlay);
+    // 'somewhere_else' is not a declared guardrail, so no terminal matches.
+    expect(agentToGuardrail.get('recruiter')).toEqual({ kind: 'none' });
+    expect(guardrailToAgents.size).toBe(0);
+  });
+
+  it('falls back to today’s behaviour when the overlay has no configReferences', () => {
+    const overlay = parsePlanObject({
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      planned_values: {
+        root_module: {
+          child_modules: [
+            {
+              address: 'module.recruiter_api',
+              resources: [
+                {
+                  address: 'module.recruiter_api.aws_bedrockagent_agent.recruiter',
+                  type: 'aws_bedrockagent_agent',
+                  name: 'recruiter',
+                  values: { guardrail_configuration: [{}] },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    expect(overlay.configReferences).toBeUndefined();
+    const { agentToGuardrail, guardrailToAgents } = buildGuardrailGraph([], overlay);
+    expect(agentToGuardrail.get('recruiter')).toEqual({ kind: 'none' });
+    expect(guardrailToAgents.size).toBe(0);
+  });
+
+  it('resolves a count/for_each agent whose plan address carries an instance index', () => {
+    // The plan expands the agent into indexed instances (recruiter[0]); the
+    // configuration block is pre-expansion (no index). Resolution must still
+    // match the indexed plan address to its index-free config entry.
+    const plan = crossModulePlan();
+    plan.planned_values.root_module.child_modules[1].resources[0].address =
+      'module.recruiter_api.aws_bedrockagent_agent.recruiter[0]';
+    const overlay = parsePlanObject(plan);
+    const { agentToGuardrail, guardrailToAgents } = buildGuardrailGraph([], overlay);
+
+    expect(agentToGuardrail.get('recruiter')).toEqual({
+      kind: 'declared-via-module',
+      guardrail: 'recruiter',
+      versionPin: 'versioned',
+    });
+    expect(guardrailToAgents.get('recruiter')).toEqual(['recruiter']);
+  });
+
+  it('resolves an object-typed module input accessed by attribute (var.guardrail.identifier)', () => {
+    // The module takes a single object input `guardrail` and the agent reads
+    // var.guardrail.identifier / .version. Both must reduce to the base input
+    // name so the call-site binding (keyed by input name) is found.
+    const overlay = parsePlanObject({
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      planned_values: {
+        root_module: {
+          child_modules: [
+            {
+              address: 'module.bedrock_governance',
+              resources: [
+                {
+                  address: 'module.bedrock_governance.aws_bedrock_guardrail.recruiter',
+                  type: 'aws_bedrock_guardrail',
+                  name: 'recruiter',
+                  values: {},
+                },
+              ],
+            },
+            {
+              address: 'module.recruiter_api',
+              resources: [
+                {
+                  address: 'module.recruiter_api.aws_bedrockagent_agent.recruiter',
+                  type: 'aws_bedrockagent_agent',
+                  name: 'recruiter',
+                  values: { guardrail_configuration: [{}] },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      configuration: {
+        root_module: {
+          module_calls: {
+            recruiter_api: {
+              expressions: {
+                guardrail: {
+                  identifier: { references: ['module.bedrock_governance.guardrail_identifier'] },
+                  version: { references: ['module.bedrock_governance.guardrail_version'] },
+                },
+              },
+              module: {
+                resources: [
+                  {
+                    address: 'aws_bedrockagent_agent.recruiter',
+                    type: 'aws_bedrockagent_agent',
+                    name: 'recruiter',
+                    expressions: {
+                      guardrail_configuration: {
+                        references: ['var.guardrail.identifier', 'var.guardrail.version'],
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+            bedrock_governance: {
+              expressions: {},
+              module: {
+                outputs: {
+                  guardrail_identifier: {
+                    expression: { references: ['aws_bedrock_guardrail.recruiter.guardrail_arn'] },
+                  },
+                  guardrail_version: {
+                    expression: { references: ['aws_bedrock_guardrail_version.recruiter.version'] },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const { agentToGuardrail } = buildGuardrailGraph([], overlay);
+    expect(agentToGuardrail.get('recruiter')).toEqual({
+      kind: 'declared-via-module',
+      guardrail: 'recruiter',
+      versionPin: 'versioned',
+    });
+  });
+
+  it('keeps the strongest link when an agent is seen as both HCL and plan instance', () => {
+    // HCL copy uses an unresolvable var ref; plan copy resolves via config refs.
+    // Result must be order-independent and pick the resolved one.
+    const overlay = parsePlanObject(crossModulePlan());
+    const files = [
+      makeParsedFile({
+        aws_bedrockagent_agent: {
+          recruiter: [
+            {
+              agent_name: 'recruiter',
+              guardrail_configuration: [
+                { guardrail_identifier: '${var.guardrail_identifier}', guardrail_version: '${var.guardrail_version}' },
+              ],
+            },
+          ],
+        },
+      }),
+    ];
+    const { agentToGuardrail } = buildGuardrailGraph(files, overlay);
+    expect(agentToGuardrail.get('recruiter')).toEqual({
+      kind: 'declared-via-module',
+      guardrail: 'recruiter',
+      versionPin: 'versioned',
+    });
   });
 });

@@ -3,6 +3,11 @@ import { getNestedValue } from '../utils/resource-helpers';
 
 const REGULATORY_REFERENCE =
   'EU AI Act Article 12(1) - Automatic logging of events must be preserved across infra changes';
+// Lifecycle-configuration deletions are a *retention* concern, not a logging
+// one: removing the lifecycle rule drops the enforced retention floor. That
+// obligation lives in Art. 19(1), not Art. 12(1).
+const RETENTION_REGULATORY_REFERENCE =
+  'EU AI Act Article 19(1) - High-risk-system logs kept for an appropriate period, at least six months (retention controls must survive infra changes)';
 const NIST_REFERENCE =
   'NIST AI RMF 1.0: MANAGE 4.1 (post-deployment monitoring plans); GOVERN 1.4 (transparent risk-management policies)';
 const ISO_REFERENCE =
@@ -175,6 +180,7 @@ function classifyDeletion(deletion: PlanDeletion, context: ScanContext): Finding
       description: `Lifecycle configuration for log bucket "${bucket ?? deletion.name}" (${address}) is scheduled for destruction; retention controls will be removed.`,
       remediation:
         'Keep the lifecycle configuration, or replace it with another rule meeting the 180-day floor before applying.',
+      regulatoryReference: RETENTION_REGULATORY_REFERENCE,
     });
   }
 
@@ -189,6 +195,9 @@ function buildDeletionFinding(args: {
   filePath: string;
   description: string;
   remediation: string;
+  // Defaults to the Art. 12(1) logging citation; the lifecycle-config branch
+  // overrides with the Art. 19(1) retention citation.
+  regulatoryReference?: string;
 }): Finding {
   const status = args.replaceWithCreate ? 'WARN' : 'FAIL';
   const description = args.replaceWithCreate
@@ -200,7 +209,7 @@ function buildDeletionFinding(args: {
     filePath: args.filePath,
     description,
     remediation: args.remediation,
-    regulatoryReference: REGULATORY_REFERENCE,
+    regulatoryReference: args.regulatoryReference ?? REGULATORY_REFERENCE,
     nistReference: NIST_REFERENCE,
     isoReference: ISO_REFERENCE,
   };

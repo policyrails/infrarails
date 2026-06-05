@@ -93,18 +93,38 @@ function extractRef(
   containingAddress: string,
   overlay?: PlanOverlay,
 ): void {
-  const ref = getNestedValue(config.body, attributePath);
-  if (ref === undefined) return;
+  let ref = getNestedValue(config.body, attributePath);
+  let sourceFilePath = config.source === 'hcl' ? config.filePath : undefined;
+  let planLiteral = config.source === 'plan';
+
+  // A plan-sourced config buried in a local module can omit an attribute the
+  // plan marked computed-at-apply-time - e.g. an s3_config.bucket_name built
+  // from the account id is dropped from planned_values entirely. The on-disk
+  // HCL block (folded in by findResources) still carries the reference that
+  // names the bucket / log-group resource, so anchor on it: resolveExpression
+  // recovers the resource address even though the plan can't resolve the literal
+  // name yet. Without this we would wrongly conclude the logging sink is absent.
+  // Terraform represents a dropped computed-at-apply attribute either by
+  // omitting it (undefined) or emitting it as null - treat both as "absent".
+  if ((ref === undefined || ref === null) && config.hclBody) {
+    const hclRef = getNestedValue(config.hclBody, attributePath);
+    if (hclRef !== undefined && hclRef !== null) {
+      ref = hclRef;
+      sourceFilePath = config.filePath; // the fold copied the HCL file path
+      planLiteral = false; // hclRef is an HCL expression - resolve it, don't take it literally
+    }
+  }
+
+  if (ref === undefined || ref === null) return;
 
   // Plan-sourced configs carry already-resolved literal values rather than
   // HCL expressions. Skip the resolver and use the value directly.
-  if (config.source === 'plan' && typeof ref === 'string' && !ref.includes('${')) {
+  if (planLiteral && typeof ref === 'string' && !ref.includes('${')) {
     if (kind === 'bucket') context.logBucketNames.push(ref);
     else context.logGroupNames.push(ref);
     return;
   }
 
-  const sourceFilePath = config.source === 'hcl' ? config.filePath : undefined;
   const result = resolveOrPlanFallback(
     ref,
     containingAddress,

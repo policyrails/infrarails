@@ -93,6 +93,31 @@ export interface PlanOverlay {
   // with `[...]` index segments stripped so refs to count/for_each modules
   // resolve regardless of which instance the expression names.
   outputs: Map<string, { value: string | number | boolean; sensitive: boolean }>;
+  // Reference (not value) graph extracted from the plan `configuration` block.
+  // Lets a resource attribute be traced to a terminal resource address across
+  // module boundaries even when the wired value is known-after-apply (so it
+  // survives where `outputs` - which only carries known scalars - cannot).
+  // Optional: absent on overlays built without the configuration block (older
+  // fixtures, plans produced without it) - callers must tolerate undefined.
+  configReferences?: ConfigReferenceGraph;
+}
+
+// A reference graph distilled from the plan `configuration` block. Every value
+// is a *qualified reference node* in one of three string-tagged forms:
+//   res:<type>.<name>            - a terminal resource (leaf address, no attr)
+//   out:module.<full-path>.<out> - a module output, resolvable via `moduleOutputs`
+//   var:<module-full-path>::<n>  - a module input variable, resolvable via `varBindings`
+// (module-full-path is "" for the root module). Edges are pre-qualified at parse
+// time so a consumer can walk them without re-deriving module scope.
+export interface ConfigReferenceGraph {
+  // '<normalised-resource-address>#<top-level-attribute>' -> qualified ref nodes
+  // reachable from that attribute's expression.
+  resourceAttrs: Map<string, string[]>;
+  // 'module.<full-path>.<output-name>' -> qualified ref nodes the output returns.
+  moduleOutputs: Map<string, string[]>;
+  // '<child-module-full-path>::<input-name>' -> qualified ref nodes bound at the
+  // call site (in the parent module's scope).
+  varBindings: Map<string, string[]>;
 }
 
 export interface ScanContext {

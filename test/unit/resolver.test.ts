@@ -430,6 +430,34 @@ describe('resolveExpression', () => {
       });
     });
 
+    it('anchors on the HCL resource address when the value is after_unknown but the resource IS declared in scanned HCL', () => {
+      // The bucket name is computed-at-apply, but the resource is on disk: the
+      // reference still names a specific resource, so we return its address for
+      // downstream identity matching rather than degrading to INCONCLUSIVE.
+      // (The test above uses files: [] - resource not on disk - and correctly
+      // stays plan-known-after-apply: there is no accurate HCL to anchor on.)
+      const files = [
+        file({ resource: { aws_s3_bucket: { logs: [{ bucket: '${var.env}-logs' }] } } }),
+      ];
+      const overlay = makeOverlay({
+        resources: [
+          {
+            key: 'aws_s3_bucket.logs',
+            values: { bucket: null },
+            unknownPaths: new Set(['bucket']),
+          },
+        ],
+      });
+      const result = resolveExpression(
+        '${aws_s3_bucket.logs.bucket}',
+        files,
+        'f',
+        undefined,
+        overlay,
+      );
+      expect(result).toMatchObject({ kind: 'address', value: 'aws_s3_bucket.logs' });
+    });
+
     it('returns plan-sensitive-redacted when attribute is in sensitivePaths', () => {
       const overlay = makeOverlay({
         resources: [

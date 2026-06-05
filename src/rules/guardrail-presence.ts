@@ -64,7 +64,7 @@ export const guardrailPresenceRule: ScanRule = {
     // Exclude guardrail types themselves so the check doesn't become circular
     // (a Terraform that declares only a guardrail and nothing else would
     // otherwise trigger the rule and immediately PASS it).
-    const directWorkload = findBedrockResources(files).filter(
+    const directWorkload = findBedrockResources(files, overlay).filter(
       (r) => r.type !== 'aws_bedrock_guardrail' && r.type !== 'aws_bedrock_guardrail_version',
     );
     const iam = findIamBedrockGrants(files);
@@ -109,8 +109,9 @@ export const guardrailPresenceRule: ScanRule = {
 
       // Anchor the WARN to the Bedrock usage that triggered it, so the alert
       // points the reviewer at the resource needing a guardrail rather than the
-      // repo root. Order mirrors the signals message above; all four helpers
-      // carry a real on-disk filePath (overlay is not threaded here).
+      // repo root. Order mirrors the signals message above. directWorkload may
+      // carry a `plan:<address>` filePath when the workload is module-buried
+      // (overlay-sourced); the IAM/VPC/data-source helpers are HCL-only.
       const triggerPath =
         directWorkload[0]?.filePath ??
         iam[0]?.filePath ??

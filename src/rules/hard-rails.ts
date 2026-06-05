@@ -144,7 +144,10 @@ function evaluateGuardrail(
   overlay: PlanOverlay | undefined,
   attachingAgents: string[],
 ): Finding {
-  const line = gr.source === 'hcl' ? findResourceLine(gr.rawHcl, 'aws_bedrock_guardrail', gr.name) : undefined;
+  // A plan instance folded with its on-disk HCL block carries the HCL raw
+  // source (so findResourceLine resolves a line) while keeping source 'plan';
+  // key the line off rawHcl, not source. Empty rawHcl (true plan-only) -> none.
+  const line = findResourceLine(gr.rawHcl, 'aws_bedrock_guardrail', gr.name);
   const sourceFilePath = gr.source === 'hcl' ? gr.filePath : undefined;
   const body = gr.body;
   const label = guardrailLabel(gr.name, attachingAgents);
@@ -214,12 +217,15 @@ function evaluateGuardrail(
   const harmfulOk = harmful.state === 'BLOCKING';
   if (!promptAttackOk || !harmfulOk) {
     const missing: string[] = [];
+    const stillEnforcing: string[] = [];
     if (!promptAttackOk) {
       missing.push(
         promptAttack.state === 'ABSENT'
           ? 'no PROMPT_ATTACK filter - prompt injection uncontrolled'
           : 'PROMPT_ATTACK filter present but not enforcing (input_strength = NONE)',
       );
+    } else {
+      stillEnforcing.push('the PROMPT_ATTACK prompt-injection filter');
     }
     if (!harmfulOk) {
       missing.push(
@@ -227,6 +233,8 @@ function evaluateGuardrail(
           ? 'no harmful-content filter declared'
           : 'all content filters set below MEDIUM',
       );
+    } else {
+      stillEnforcing.push('a harmful-content filter (MEDIUM+)');
     }
     return {
       ...base,
@@ -234,6 +242,9 @@ function evaluateGuardrail(
       description:
         `${label} is missing a mandatory control: ${missing.join('; ')}. Attaching this ` +
         `guardrail satisfies S-9.x.1 / S-9.x.2 but leaves the named risk uncontrolled.` +
+        (stillEnforcing.length > 0
+          ? ` The other mandatory surface is enforcing: ${stillEnforcing.join(' and ')}.`
+          : '') +
         conditionalContext(pii, grounding, denyTopics) +
         (attachingAgents.length === 0 ? UNATTACHED_NOTE : ''),
       remediation: gapRemediation(),
@@ -495,14 +506,16 @@ function conditionalContext(
 function emptyRemediation(): string {
   return (
     'Populate the guardrail body: add a content_policy_config.filters_config block with ' +
-    'type = "PROMPT_ATTACK" and input_strength = "MEDIUM" or "HIGH", and at least one ' +
+    'type = "PROMPT_ATTACK" and input_strength set to any non-NONE value ("LOW", "MEDIUM", ' +
+    'or "HIGH"; "MEDIUM"/"HIGH" recommended), and at least one ' +
     `harmful-content filter (e.g. type = "HATE") set to "MEDIUM"/"HIGH". ${VENDOR_SCOPE_NOTE}`
   );
 }
 
 function gapRemediation(): string {
   return (
-    'Add a PROMPT_ATTACK filter with input_strength = "MEDIUM" or "HIGH", and set at least ' +
+    'Add a PROMPT_ATTACK filter with input_strength set to any non-NONE value ("LOW", ' +
+    '"MEDIUM", or "HIGH"; "MEDIUM"/"HIGH" recommended), and set at least ' +
     'one harmful-content filter category to "MEDIUM"/"HIGH". PII redaction and contextual ' +
     `grounding are suggested where applicable but do not gate this check. ${VENDOR_SCOPE_NOTE}`
   );

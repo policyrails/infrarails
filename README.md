@@ -1,10 +1,35 @@
 # infrarails
 
-> Static compliance scanner for AWS AI infrastructure. Reads Terraform and reports which Article 9 (Bedrock Guardrails) and Article 12 (logging, retention, traceability) controls are passing, failing, or unverifiable - mapped to **EU AI Act**, **NIST AI RMF**, and **ISO/IEC 42001**.
+> Static **EU AI Act / NIST AI RMF / ISO 42001** compliance scanner for **AWS Bedrock** Terraform. Reads your `.tf` files - no deploy, no AWS credentials - and reports which Article 9 (guardrails) and Article 12 (logging, retention, traceability) controls pass, fail, or can't be verified.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![npm version](https://img.shields.io/npm/v/infrarails.svg)](https://www.npmjs.com/package/infrarails)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
+
+---
+
+## Install and scan in 60 seconds
+
+```bash
+# 1. hcl2json - the HCL-to-JSON helper infrarails shells out to (macOS shown; Linux/Windows in Prerequisites)
+brew install hcl2json
+
+# 2. infrarails
+npm install -g infrarails
+
+# 3. scan a Terraform directory
+infrarails ./infra/
+```
+
+That is the whole happy path - no deploy, no AWS credentials. Want a report to share? Add `--format pdf -o report.pdf` (or `--format html`). Runs natively on macOS, Linux, and Windows (PowerShell / `cmd.exe`); per-OS install commands for both dependencies are in [Prerequisites](#prerequisites).
+
+### What you get
+
+Color-coded findings grouped by status, each cross-referenced to the **EU AI Act**, **NIST AI RMF**, and **ISO/IEC 42001** control it maps to. Two real scans, rendered with `--format pdf`:
+
+| `sample-chat-bedrock` (small, focused stack) | `infrastructure` (large multi-stack estate) |
+| --- | --- |
+| [![Bedrock chat sample report](docs/samples/sample-report-bedrock.png)](docs/samples/sample-report-bedrock.png) | [![Multi-stack infrastructure sample report](docs/samples/sample-report-infrastructure.png)](docs/samples/sample-report-infrastructure.png) |
 
 ---
 
@@ -21,47 +46,6 @@ Each finding is cross-referenced against:
 The scanner is **deliberately conservative**: when it cannot prove a control is in place, it emits `INCONCLUSIVE` rather than `PASS` or `FAIL`. For a compliance tool, "we couldn't verify" is the only honest answer when evidence is split across stacks, modules, or runtime values.
 
 > **Prerequisite, not a certificate.** A fully passing run is a **necessary but not sufficient** condition for EU AI Act / NIST AI RMF / ISO 42001 conformance. `infrarails` only verifies that a narrow set of AWS Bedrock infrastructure primitives are **declared** in your Terraform - it does not evaluate organisational, procedural, application-level, or runtime controls. See the [Disclaimer](#disclaimer) for the full scope statement.
-
----
-
-## Quick start
-
-**1. Install `hcl2json`** (one-time, per OS):
-
-```bash
-# macOS
-brew install hcl2json
-
-# Ubuntu / Debian (apt-based)
-curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
-sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
-
-# Other Linux (RHEL/Fedora/Arch/Alpine - same binary, pick arm64 if needed)
-curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
-sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
-```
-
-```powershell
-# Windows (PowerShell)
-$dest = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Invoke-WebRequest -Uri "https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_windows_amd64.exe" -OutFile "$dest\hcl2json.exe"
-$env:Path = "$dest;$env:Path"
-```
-
-**2. Install `infrarails` and scan:**
-
-```bash
-npm install -g infrarails
-
-# scan a Terraform directory
-infrarails ./infra/
-
-# generate a shareable report
-infrarails ./infra/ --format pdf  -o report.pdf
-infrarails ./infra/ --format html -o report.html
-```
-
-Runs natively on **macOS, Linux, and Windows** (PowerShell / `cmd.exe`). For full Node install commands and managed-machine notes, see [Prerequisites](#prerequisites). For audit-grade runs that resolve expressions and see inside remote modules, see [Audit-grade scan with `--plan`](#audit-grade-scan-with---plan).
 
 ---
 
@@ -187,31 +171,37 @@ infrarails ./infra/ --strict-account-logging          # tightest verdict (single
 
 The CLI invokes `hcl2json` via `child_process.spawnSync` over stdin (no shell), so behaviour is identical across macOS, Linux, and native Windows.
 
-`hcl2json` install commands are covered in [Quick start](#quick-start). Below are the **Node.js** install commands per OS - skip whichever block doesn't apply.
+Below are per-OS commands to install **both** dependencies - skip whichever block doesn't apply.
 
 ```bash
-# macOS (also installs hcl2json in one go)
+# macOS (Homebrew installs both in one go)
 brew install node hcl2json
 
-# Ubuntu / Debian (apt-based)
+# Ubuntu / Debian (apt-based): Node, then the hcl2json binary
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
+curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
+sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
 
-# Other Linux (RHEL/Fedora)
+# Other Linux (RHEL/Fedora): same hcl2json binary (pick arm64 if needed)
 curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
 sudo dnf install -y nodejs    # or: sudo yum install -y nodejs
+curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
+sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
 
-# Other Linux (Arch)
-sudo pacman -S nodejs npm
-
-# Other Linux (Alpine)
-sudo apk add nodejs npm
+# Other Linux (Arch / Alpine): pacman/apk for Node, then the hcl2json binary above
+sudo pacman -S nodejs npm        # Arch
+sudo apk add nodejs npm          # Alpine
 ```
 
 ```powershell
-# Windows (PowerShell)
+# Windows (PowerShell): Node via winget, hcl2json via direct download
 winget install OpenJS.NodeJS.LTS
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser   # required for npm.ps1 on fresh installs
+
+$dest = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri "https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_windows_amd64.exe" -OutFile "$dest\hcl2json.exe"
+$env:Path = "$dest;$env:Path"
 ```
 
 > **If `Set-ExecutionPolicy` fails** with a Group Policy error (common on managed machines), run a single command via `cmd /c npm ...` or `powershell -ExecutionPolicy Bypass -Command "..."`. WSL is also fine - install via the Ubuntu/Debian instructions inside the WSL shell, and keep your Terraform tree in the WSL filesystem (`~/...`) rather than `/mnt/c/...` for performance.
@@ -247,14 +237,6 @@ After cloning, `git pull && npm run build` is enough to pick up upstream changes
 | `pdf` | Paginated, server-side via [`pdfkit`](https://pdfkit.org/) - no headless Chromium. Layout mirrors HTML. **Recommended for sharing with auditors** and over channels where HTML is awkward. On Windows, PDF avoids the SmartScreen warning that HTML opened from UNC paths (`\\wsl.localhost\...`) triggers |
 | `json` | Machine-readable. Each finding includes `ruleId`, `status`, `description`, `remediation`, and `regulatoryReference` / `nistReference` / `isoReference` |
 | `sarif` | SARIF 2.1.0 - OASIS standard consumed by GitHub Code Scanning, Azure DevOps, GitLab, and the VS Code SARIF Viewer (see [SARIF and GitHub Code Scanning](#sarif-and-github-code-scanning)) |
-
-### Sample reports
-
-Page 1 of two real scans, generated with `--format pdf`:
-
-| `sample-chat-bedrock` (small, focused stack) | `infrastructure` (large multi-stack estate) |
-| --- | --- |
-| [![Bedrock chat sample report](docs/samples/sample-report-bedrock.png)](docs/samples/sample-report-bedrock.png) | [![Multi-stack infrastructure sample report](docs/samples/sample-report-infrastructure.png)](docs/samples/sample-report-infrastructure.png) |
 
 ---
 

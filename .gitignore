@@ -5,8 +5,11 @@ dist/
 .claude/
 docs/*
 !docs/samples/
-# Internal-only engineering notes — intentionally NOT committed.
+# Internal-only engineering notes - intentionally NOT committed.
 # (docs/* already ignores these; listed explicitly so the intent is obvious.)
 docs/known-issues/
 *.pdf
+
+# Local-only project instructions for Claude - intentionally NOT committed.
+/CLAUDE.md
 

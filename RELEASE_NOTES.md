@@ -1,5 +1,42 @@
 # Release Notes
 
+## v0.3.0 — Guardrail-body enforcement (Article 9) and corrected retention citations
+
+This release completes the Bedrock guardrail progression — *presence → attachment → **body*** — with a new rule that inspects what a guardrail actually does, not just that one exists. It also corrects two regulatory citations to the Articles the obligations genuinely come from, fixes a finding-formatter bug that silently dropped articles from multi-citation rules, and makes `--plan` resolution more reliable for module-buried resources.
+
+### Added
+
+- **`S-9.x.3` (WARN) — guardrail-body enforcement.** `S-9.x.1`/`S-9.x.2` confirm a guardrail is *attached* and *declared* but never look inside it, so a guardrail with every action set to `NONE` passed both while providing no control surface. `S-9.x.3` inspects each `aws_bedrock_guardrail` body with a tiered model:
+  - **Mandatory surfaces gate the verdict** — a `PROMPT_ATTACK` prompt-injection filter and a harmful-content filter at `MEDIUM`/`HIGH`.
+  - **Supporting surfaces are scored as context, never penalised on absence** — PII (including `ANONYMIZE`), contextual grounding, and denied topics.
+  - `var`/`local` values are resolved via the resolver; a mandatory surface backed by an unresolvable expression is `INCONCLUSIVE` and carries `unresolvedReason`, so strict-mode escalation works.
+  - Findings name the **attaching agents** (blast radius) and append an SDK-blind-spot note for unattached guardrails.
+  - Citations verified verbatim against the EU AI Act vault: **Art. 9(2)(d), 9(5)(b), 15(4), 15(5) para 3**.
+- **`buildGuardrailGraph` helper** — a shared agent ↔ guardrail reference graph now backs both the attachment rule (`S-9.x.1`) and the new body rule.
+
+### Changed / Fixed
+
+- **Retention rules now cite the correct Article.** `S-12.1.2a` (CloudWatch retention) and `S-12.1.2b` (S3 lifecycle) previously attributed their duration floor to Article 12 and said "no specific number is named." The 180-day floor actually derives from **Art. 19(1)** — logs "shall be kept for a period appropriate to the intended purpose … of at least six months." Remediation text, header comments, and `regulatoryReference` metadata in both rules now cite Art. 19(1) with the correct quote. **Rule IDs and verdict logic are unchanged.**
+- **`S-9.x.1` no longer mis-flags a resolvable reference.** A guardrail reference that resolves to a declared resource now `PASS`es (it was wrongly `INCONCLUSIVE` because of the `${…}` wrapper); a reference to an external/undeclared guardrail `WARN`s.
+- **`S-9.x.2` is plan-overlay aware.** A guardrail declared inside a module — visible only in the plan, not the raw HCL of the scanned directory — used to trip a false "no guardrail declared" WARN while `S-9.x.3` was busy inspecting that same guardrail's body. The presence lookup now threads `context.planOverlay` so both rules agree on whether the guardrail exists, and the WARN's `filePath` anchors to the triggering Bedrock resource instead of repo root.
+- **Multi-article citation pills no longer mangle or drop articles.** The finding formatter split EU AI Act citations on the first ` - `, assuming a single-citation shape. `S-9.x.3` cites four articles in paren form, so the parser swallowed the prose into the id and silently dropped `Art. 9(5)(b)`, `15(4)`, and `15(5)`. Citations now render one numbers-only pill per article. This also restores the dropped second article on dash-form multi-citations (`s3-versioning`, `s3-encryption`). Raw `regulatoryReference` in JSON/SARIF output is untouched.
+
+### Plan-mode (`--plan`) resolution
+
+- **Configuration reference graph.** The plan parser now distils the plan `configuration` block into a pre-qualified edge graph (resource-attribute, module-output, and call-site variable bindings). Because it records what an attribute *references* rather than what it resolves to, the graph survives `known-after-apply`, letting bucket/log-group matching anchor on HCL identity for module-buried and computed-name resources. This keeps `--plan` strictly *more* informative than a source-only scan, never less certain. See the new `module-computed-bucket` fixture.
+
+### Internal
+
+- **CLI version is injected from `package.json` at build time** via tsup (`__APP_VERSION__`), replacing a hardcoded literal that had drifted to `0.2.1`.
+- Package description broadened to "Article 9 & 12".
+- README and ARCHITECTURE updated for the guardrail-body rule and plan-mode resolution.
+
+### Verification
+
+- **397/397 unit + e2e tests pass** (up from 317 in v0.2.1), including new suites for the guardrail graph, the hard-rails rule, the config-reference plan parser, and the formatter citation regressions.
+
+---
+
 ## v0.2.1 — SARIF output compatible with GitHub Code Scanning
 
 Hot-fix for SARIF reports rejected by `github/codeql-action/upload-sarif` when the scanner was run with `--plan`. Two GitHub-specific ingestion rules were being violated by the v0.2.0 emitter — both now satisfied.

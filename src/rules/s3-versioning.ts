@@ -5,7 +5,7 @@ export const s3VersioningRule: ScanRule = {
   id: 'S-12.x.1',
   description: 'S3 log bucket must have versioning or Object Lock enabled',
   severity: 'FAIL',
-  regulatoryReference: 'EU AI Act Article 12 - Immutability of logged data',
+  regulatoryReference: 'EU AI Act Article 19(1) - Logs must be kept intact for at least six months (versioning/Object Lock preserves them against silent overwrite or deletion); Article 15(5) - resilience against unauthorised alteration of system outputs',
   nistReference: 'NIST AI RMF 1.0: MEASURE 2.7 (security and resilience); MANAGE 4.3 (incident response evidence preservation)',
   isoReference: 'ISO/IEC 42001:2023 Annex A: A.6.2.8 (AI system event logs - integrity); A.6.2.4 (AI system verification and validation)',
 

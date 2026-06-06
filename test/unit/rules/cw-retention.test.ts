@@ -45,6 +45,10 @@ describe('S-12.1.2a CloudWatch Retention', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0].status).toBe('WARN');
     expect(findings[0].remediation).toContain('No CloudWatch subscription filter was found');
+    expect(findings[0].remediation).toContain('EU AI Act Art. 19(1)');
+    expect(findings[0].remediation).toContain('at least six months');
+    expect(findings[0].remediation).toContain('180-day floor');
+    expect(findings[0].remediation).toContain('365 days is the typical floor for production AI');
   });
 
   it('should WARN with forwarder-found note when subscription filter is present', () => {

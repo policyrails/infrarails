@@ -7,7 +7,8 @@ import {
 } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 
-const REGULATORY_REFERENCE = 'EU AI Act Article 12 - Audit trail for AI system events';
+const REGULATORY_REFERENCE =
+  'EU AI Act Article 12(2) - Logging to enable traceability of events relevant to risk identification, post-market monitoring (Art. 72), and operation monitoring (Art. 26(5))';
 const NIST_REFERENCE = 'NIST AI RMF 1.0: MANAGE 4.1 (post-deployment monitoring plans); GOVERN 1.4 (transparent risk-management policies); MEASURE 2.7 (security and resilience)';
 const ISO_REFERENCE = 'ISO/IEC 42001:2023 Annex A: A.6.2.8 (AI system event logs); A.3.3 (Reporting of concerns)';
 
@@ -25,7 +26,11 @@ export const cloudtrailRule: ScanRule = {
   isoReference: ISO_REFERENCE,
 
   run(files: ParsedFile[], context: ScanContext): Finding[] {
-    const trails = findResources(files, 'aws_cloudtrail');
+    // Thread the plan overlay so a trail declared inside a module (visible only
+    // via planned_values, not the scanned HCL) is detected. Without it, a real
+    // trail in a module falls through to INCONCLUSIVE/FAIL, inconsistent with
+    // every other resource-scanning rule.
+    const trails = findResources(files, 'aws_cloudtrail', context.planOverlay);
 
     // Trail(s) present - check whether logging is actually enabled.
     if (trails.length > 0) {

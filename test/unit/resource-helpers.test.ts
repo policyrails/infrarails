@@ -406,7 +406,7 @@ function planOverlayWith(resources: PlanResource[]): PlanOverlay {
   };
 }
 
-describe('findResources plan overlay dedup', () => {
+describe('findResources plan overlay reconciliation', () => {
   it('suppresses the root-level plan duplicate of an HCL resource', () => {
     const files = [pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'root-logs' }] } } })];
     const overlay = planOverlayWith([
@@ -417,7 +417,50 @@ describe('findResources plan overlay dedup', () => {
     expect(found[0].source).toBe('hcl');
   });
 
-  it('keeps a module-buried plan resource even when its leaf name collides with an HCL resource', () => {
+  it('folds a local-module HCL block with its module-buried plan instance into one entry', () => {
+    // Reproduces the reported duplicate: a guardrail in a local module is
+    // walked from disk (un-prefixed in HCL) AND surfaced by the plan overlay
+    // (module-prefixed). It is ONE resource and must yield ONE entry.
+    const files = [pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'root-logs' }] } } }, 'modules/logging/main.tf')];
+    const overlay = planOverlayWith([
+      planRes('module.logging.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'resolved-logs' }),
+    ]);
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(1);
+    // Plan instance is kept (resolved body + address) but borrows the HCL file
+    // path so the finding stays attributable to source.
+    expect(found[0].address).toBe('module.logging.aws_s3_bucket.logs');
+    expect(found[0].body.bucket).toBe('resolved-logs');
+    expect(found[0].filePath).toBe('modules/logging/main.tf');
+  });
+
+  it('collapses count/for_each instances of a module resource to one entry', () => {
+    const files: ParsedFile[] = [];
+    const overlay = planOverlayWith([
+      planRes('module.logging.aws_s3_bucket.logs[0]', 'aws_s3_bucket', 'logs', { bucket: 'a' }),
+      planRes('module.logging.aws_s3_bucket.logs[1]', 'aws_s3_bucket', 'logs', { bucket: 'b' }),
+    ]);
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(1);
+  });
+
+  it('keeps distinct module calls that share a leaf name as separate entries', () => {
+    const files: ParsedFile[] = [];
+    const overlay = planOverlayWith([
+      planRes('module.logging_us.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'us' }),
+      planRes('module.logging_eu.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'eu' }),
+    ]);
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(2);
+    expect(found.map((r) => r.address).sort()).toEqual([
+      'module.logging_eu.aws_s3_bucket.logs',
+      'module.logging_us.aws_s3_bucket.logs',
+    ]);
+  });
+
+  it('keeps a root HCL block when its leaf name also appears under a module', () => {
+    // Rare leaf-name collision: a root resource and an unrelated module resource
+    // share a name. The root HCL block must survive (not be folded away).
     const files = [pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'root-logs' }] } } })];
     const overlay = planOverlayWith([
       planRes('aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'root-logs' }),
@@ -425,9 +468,198 @@ describe('findResources plan overlay dedup', () => {
     ]);
     const found = findResources(files, 'aws_s3_bucket', overlay);
     expect(found).toHaveLength(2);
-    const plan = found.find((r) => r.source === 'plan');
-    expect(plan?.address).toBe('module.audit.aws_s3_bucket.logs');
-    expect(plan?.body.bucket).toBe('audit-logs');
+    expect(found.some((r) => r.source === 'hcl')).toBe(true);
+    expect(found.some((r) => r.address === 'module.audit.aws_s3_bucket.logs')).toBe(true);
+  });
+
+  it('keeps a genuinely plan-only resource (no HCL on disk)', () => {
+    const files: ParsedFile[] = [];
+    const overlay = planOverlayWith([
+      planRes('module.remote.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'remote-logs' }),
+    ]);
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(1);
+    expect(found[0].source).toBe('plan');
+    expect(found[0].filePath).toBe('plan:module.remote.aws_s3_bucket.logs');
+  });
+});
+
+// Regression suite for the leaf-name reconciliation bug: a plan instance must
+// be paired with the on-disk HCL block of the SAME resource (by module
+// directory), never merely by leaf name. Two failures the old code produced:
+//   (1) a TARGETED plan dropped a root resource that shared a module leaf name;
+//   (2) two local modules sharing the `this` leaf name cross-wired attribution.
+// Core invariant (CLAUDE.md): supplying a plan must NEVER make the scanner less
+// certain than scanning source alone - in particular, never drop a resource.
+describe('findResources reconciliation - leaf-name collision robustness', () => {
+  // A root module main.tf that wires a local child module, plus the child's file.
+  const rootWithModule = (
+    moduleBlocks: Record<string, unknown>,
+    rootResources?: Record<string, unknown>,
+  ): ParsedFile =>
+    pf(
+      { ...(rootResources ? { resource: rootResources } : {}), module: moduleBlocks },
+      'main.tf',
+    );
+
+  it('(1) targeted plan does NOT drop a root resource that shares a module leaf name', () => {
+    const files = [
+      rootWithModule(
+        { app: [{ source: './modules/app' }] },
+        { aws_s3_bucket: { logs: [{ bucket: 'root-logs' }] } },
+      ),
+      pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'app-bucket' }] } } }, 'modules/app/main.tf'),
+    ];
+    // `terraform plan -target=module.app`: the root bucket is absent from the plan.
+    const overlay = planOverlayWith([
+      planRes('module.app.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'app-bucket' }),
+    ]);
+
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+
+    // Root bucket survives, attributed to its OWN file (not cross-wired).
+    const root = found.find((r) => r.source === 'hcl');
+    expect(root).toBeDefined();
+    expect(root?.filePath).toBe('main.tf');
+    expect(root?.body.bucket).toBe('root-logs');
+    // Module bucket present, paired with its own module file.
+    const appInst = found.find((r) => r.address === 'module.app.aws_s3_bucket.logs');
+    expect(appInst?.filePath).toBe('modules/app/main.tf');
+    expect(found).toHaveLength(2);
+  });
+
+  it('(1b) source-only and targeted-plan scans agree on which resources exist', () => {
+    const files = [
+      rootWithModule(
+        { app: [{ source: './modules/app' }] },
+        { aws_s3_bucket: { logs: [{ bucket: 'root-logs' }] } },
+      ),
+      pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'app-bucket' }] } } }, 'modules/app/main.tf'),
+    ];
+    const sourceOnly = findResources(files, 'aws_s3_bucket'); // no overlay
+    const withPlan = findResources(files, 'aws_s3_bucket', planOverlayWith([
+      planRes('module.app.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'app-bucket' }),
+    ]));
+    // The plan must not REMOVE a resource the source-only scan saw.
+    expect(withPlan.length).toBeGreaterThanOrEqual(sourceOnly.length);
+    // The root bucket is present in both.
+    expect(sourceOnly.some((r) => r.filePath === 'main.tf')).toBe(true);
+    expect(withPlan.some((r) => r.filePath === 'main.tf')).toBe(true);
+  });
+
+  it('(2) two local modules sharing leaf name "this" each fold to their OWN file', () => {
+    const files = [
+      rootWithModule({
+        us: [{ source: './modules/us' }],
+        eu: [{ source: './modules/eu' }],
+      }),
+      pf({ resource: { aws_s3_bucket: { this: [{ bucket: 'us-bucket' }] } } }, 'modules/us/main.tf'),
+      pf({ resource: { aws_s3_bucket: { this: [{ bucket: 'eu-bucket' }] } } }, 'modules/eu/main.tf'),
+    ];
+    const overlay = planOverlayWith([
+      planRes('module.us.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'us-bucket' }),
+      planRes('module.eu.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'eu-bucket' }),
+    ]);
+
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(2);
+
+    const us = found.find((r) => r.address === 'module.us.aws_s3_bucket.this');
+    const eu = found.find((r) => r.address === 'module.eu.aws_s3_bucket.this');
+    // Correct, NOT cross-wired: each borrows its own module's file and HCL body.
+    expect(us?.filePath).toBe('modules/us/main.tf');
+    expect(us?.hclBody?.bucket).toBe('us-bucket');
+    expect(eu?.filePath).toBe('modules/eu/main.tf');
+    expect(eu?.hclBody?.bucket).toBe('eu-bucket');
+  });
+
+  it('(3) degenerate: same leaf name across modules with NO wiring - no loss, no cross-wire', () => {
+    // Module subtrees scanned without the root that wires them. The directory
+    // index cannot disambiguate, so we conservatively do NOT fold: no resource
+    // is dropped and no plan entry borrows the wrong file (safe over precise).
+    const files = [
+      pf({ resource: { aws_s3_bucket: { this: [{ bucket: 'us-bucket' }] } } }, 'modules/us/main.tf'),
+      pf({ resource: { aws_s3_bucket: { this: [{ bucket: 'eu-bucket' }] } } }, 'modules/eu/main.tf'),
+    ];
+    const overlay = planOverlayWith([
+      planRes('module.us.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'us-bucket' }),
+      planRes('module.eu.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'eu-bucket' }),
+    ]);
+
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    // Both HCL blocks retained with correct buckets (nothing lost).
+    expect(found.filter((r) => r.source === 'hcl').map((r) => r.body.bucket).sort()).toEqual([
+      'eu-bucket',
+      'us-bucket',
+    ]);
+    // Plan entries are NOT cross-wired onto another module's file.
+    for (const r of found.filter((r) => r.source === 'plan')) {
+      expect(r.filePath.startsWith('plan:')).toBe(true);
+      expect(r.hclBody).toBeUndefined();
+    }
+    // Both module addresses are present (no instance silently lost).
+    expect(found.some((r) => r.address === 'module.us.aws_s3_bucket.this')).toBe(true);
+    expect(found.some((r) => r.address === 'module.eu.aws_s3_bucket.this')).toBe(true);
+  });
+
+  it('(4) nested local modules resolve the full module path', () => {
+    const files = [
+      rootWithModule({ outer: [{ source: './modules/outer' }] }),
+      pf({ module: { inner: [{ source: './inner' }] } }, 'modules/outer/main.tf'),
+      pf(
+        { resource: { aws_s3_bucket: { data: [{ bucket: 'inner-bucket' }] } } },
+        'modules/outer/inner/main.tf',
+      ),
+    ];
+    const overlay = planOverlayWith([
+      planRes('module.outer.module.inner.aws_s3_bucket.data', 'aws_s3_bucket', 'data', {
+        bucket: 'inner-bucket',
+      }),
+    ]);
+
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(1);
+    expect(found[0].address).toBe('module.outer.module.inner.aws_s3_bucket.data');
+    expect(found[0].filePath).toBe('modules/outer/inner/main.tf');
+    expect(found[0].body.bucket).toBe('inner-bucket');
+  });
+
+  it('(5) one module reused under two names (shared source dir) - present once each, no cross-wire', () => {
+    const files = [
+      rootWithModule({
+        a: [{ source: './mod' }],
+        b: [{ source: './mod' }],
+      }),
+      pf({ resource: { aws_s3_bucket: { this: [{ bucket: 'shared' }] } } }, 'mod/main.tf'),
+    ];
+    const overlay = planOverlayWith([
+      planRes('module.a.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'shared' }),
+      planRes('module.b.aws_s3_bucket.this', 'aws_s3_bucket', 'this', { bucket: 'shared' }),
+    ]);
+
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    // Exactly the two distinct module instances - no duplicate, no missing.
+    expect(found.map((r) => r.address).sort()).toEqual([
+      'module.a.aws_s3_bucket.this',
+      'module.b.aws_s3_bucket.this',
+    ]);
+  });
+
+  it('(6) remote-module-only and a same-named local resource stay distinct', () => {
+    const files = [
+      pf({ resource: { aws_s3_bucket: { logs: [{ bucket: 'local-logs' }] } } }, 'main.tf'),
+    ];
+    const overlay = planOverlayWith([
+      planRes('aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'local-logs' }),
+      planRes('module.remote.aws_s3_bucket.logs', 'aws_s3_bucket', 'logs', { bucket: 'remote-logs' }),
+    ]);
+    const found = findResources(files, 'aws_s3_bucket', overlay);
+    expect(found).toHaveLength(2);
+    // Root stays HCL-attributed; remote stays plan-only and is not dropped.
+    expect(found.some((r) => r.source === 'hcl' && r.filePath === 'main.tf')).toBe(true);
+    const remote = found.find((r) => r.address === 'module.remote.aws_s3_bucket.logs');
+    expect(remote?.source).toBe('plan');
+    expect(remote?.filePath).toBe('plan:module.remote.aws_s3_bucket.logs');
   });
 });
 

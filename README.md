@@ -1,10 +1,35 @@
 # infrarails
 
-> Static compliance scanner for AWS AI infrastructure. Reads Terraform and reports which Article 9 (Bedrock Guardrails) and Article 12 (logging, retention, traceability) controls are passing, failing, or unverifiable - mapped to **EU AI Act**, **NIST AI RMF**, and **ISO/IEC 42001**.
+> Static **EU AI Act / NIST AI RMF / ISO 42001** compliance scanner for **AWS Bedrock** Terraform. Reads your `.tf` files - no deploy, no AWS credentials - and reports which Article 9 (guardrails) and Article 12 (logging, retention, traceability) controls pass, fail, or can't be verified.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![npm version](https://img.shields.io/npm/v/infrarails.svg)](https://www.npmjs.com/package/infrarails)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
+
+---
+
+## Install and scan in 60 seconds
+
+```bash
+# 1. hcl2json - the HCL-to-JSON helper infrarails shells out to (macOS shown; Linux/Windows in Prerequisites)
+brew install hcl2json
+
+# 2. infrarails
+npm install -g infrarails
+
+# 3. scan a Terraform directory
+infrarails ./infra/
+```
+
+That is the whole happy path - no deploy, no AWS credentials. Want a report to share? Add `--format pdf -o report.pdf` (or `--format html`). Runs natively on macOS, Linux, and Windows (PowerShell / `cmd.exe`); per-OS install commands for both dependencies are in [Prerequisites](#prerequisites).
+
+### What you get
+
+Color-coded findings grouped by status, each cross-referenced to the **EU AI Act**, **NIST AI RMF**, and **ISO/IEC 42001** control it maps to. Two real scans, rendered with `--format pdf`:
+
+| `sample-chat-bedrock` (small, focused stack) | `infrastructure` (large multi-stack estate) |
+| --- | --- |
+| [![Bedrock chat sample report](docs/samples/sample-report-bedrock.png)](docs/samples/sample-report-bedrock.png) | [![Multi-stack infrastructure sample report](docs/samples/sample-report-infrastructure.png)](docs/samples/sample-report-infrastructure.png) |
 
 ---
 
@@ -24,55 +49,15 @@ The scanner is **deliberately conservative**: when it cannot prove a control is 
 
 ---
 
-## Quick start
-
-**1. Install `hcl2json`** (one-time, per OS):
-
-```bash
-# macOS
-brew install hcl2json
-
-# Ubuntu / Debian (apt-based)
-curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
-sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
-
-# Other Linux (RHEL/Fedora/Arch/Alpine - same binary, pick arm64 if needed)
-curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
-sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
-```
-
-```powershell
-# Windows (PowerShell)
-$dest = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Invoke-WebRequest -Uri "https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_windows_amd64.exe" -OutFile "$dest\hcl2json.exe"
-$env:Path = "$dest;$env:Path"
-```
-
-**2. Install `infrarails` and scan:**
-
-```bash
-npm install -g infrarails
-
-# scan a Terraform directory
-infrarails ./infra/
-
-# generate a shareable report
-infrarails ./infra/ --format pdf  -o report.pdf
-infrarails ./infra/ --format html -o report.html
-```
-
-Runs natively on **macOS, Linux, and Windows** (PowerShell / `cmd.exe`). For full Node install commands and managed-machine notes, see [Prerequisites](#prerequisites). For audit-grade runs that resolve expressions and see inside remote modules, see [Audit-grade scan with `--plan`](#audit-grade-scan-with---plan).
-
----
-
 ## Rules
 
-`infrarails` ships **10 rules** mapped to Articles 9 and 12. Each finding is one of: **PASS**, **FAIL**, **WARN**, **SKIP**, or **INCONCLUSIVE**.
+`infrarails` ships **11 rules** mapped to Articles 9 and 12. Each finding is one of: **PASS**, **FAIL**, **WARN**, **SKIP**, or **INCONCLUSIVE**.
 
 | Rule ID | Severity | Article | Check |
 |---|---|---|---|
 | `S-9.x.1` | FAIL | 9 | Bedrock Agents must have a versioned guardrail attached (Agent-attached only - raw `InvokeModel`/`Converse` SDK calls are application-layer and out of scope for static IaC scanning) |
 | `S-9.x.2` | WARN | 9 | When Bedrock is in use, at least one `aws_bedrock_guardrail` should be declared in the scanned Terraform |
+| `S-9.x.3` | WARN | 9, 15 | `aws_bedrock_guardrail` bodies must enforce both mandatory surfaces - a `PROMPT_ATTACK` prompt-injection filter and a harmful-content filter at `MEDIUM`/`HIGH`. PII (incl. `ANONYMIZE`), contextual grounding, and denied topics score as supporting context, never penalised on absence. AWS Bedrock Guardrails only |
 | `S-12.1.1` | FAIL | 12 | `aws_bedrock_model_invocation_logging_configuration` is declared when Bedrock is in use |
 | `S-12.1.2a` | WARN | 12 | CloudWatch log group has retention ≥ 180 days, or a forwarder is detected. Escalates to **FAIL** under `--strict-account-logging` when no subscription filter is found |
 | `S-12.1.2b` | FAIL | 12 | S3 log bucket lifecycle ≥ 180 days (FAIL < 180; WARN 180-364; PASS ≥ 365) |
@@ -112,9 +97,12 @@ The hardest part of static compliance scanning isn't matching resource types - i
 
 **Bedrock Guardrails - Agent-attached vs SDK runtime.**
 
-- `S-9.x.1` covers Agent attachment via `guardrail_configuration` on `aws_bedrockagent_agent`. It verifies `guardrail_identifier` is non-empty and `guardrail_version` is numbered (not `"DRAFT"`).
-- `S-9.x.2` is a weaker presence check - "is *any* guardrail declared anywhere?" - that WARNs rather than FAILs, since guardrails commonly live in a separate security stack.
-- Neither rule verifies SDK-level `guardrailIdentifier` parameters on `InvokeModel`/`Converse`. That's application code, not IaC, and is called out in both rules' remediation messages so a passing `S-9.x.1` is never read as covering SDK-driven workloads.
+The three guardrail rules form a **presence → attachment → body** progression - three angles on one concept, so a clean run means a guardrail exists, is wired to the agent, *and* actually blocks something:
+
+- `S-9.x.2` is the weakest presence check - "is *any* guardrail declared anywhere?" - that WARNs rather than FAILs, since guardrails commonly live in a separate security stack.
+- `S-9.x.1` covers Agent attachment via `guardrail_configuration` on `aws_bedrockagent_agent`. It verifies `guardrail_identifier` is non-empty and `guardrail_version` is numbered (not `"DRAFT"`). A guardrail attached *by reference* to a definition in scope now PASSes (the correct Terraform idiom); a reference to a guardrail not in the scanned tree WARNs ("may live in another stack").
+- `S-9.x.3` inspects the guardrail *body*: attaching a guardrail with every action set to `NONE` passes `S-9.x.1`/`S-9.x.2` but provides no control surface. It WARNs when either mandatory surface (a `PROMPT_ATTACK` filter, a harmful-content filter) is absent or permissive, and PASSes only when both block.
+- None of the three verify SDK-level `guardrailIdentifier` parameters on `InvokeModel`/`Converse`. That's application code, not IaC, and is called out in the rules' remediation messages so a passing `S-9.x.1` is never read as covering SDK-driven workloads.
 
 **Variables, locals, and data sources** are resolved when possible. The resolver returns one of three outcomes:
 
@@ -183,31 +171,37 @@ infrarails ./infra/ --strict-account-logging          # tightest verdict (single
 
 The CLI invokes `hcl2json` via `child_process.spawnSync` over stdin (no shell), so behaviour is identical across macOS, Linux, and native Windows.
 
-`hcl2json` install commands are covered in [Quick start](#quick-start). Below are the **Node.js** install commands per OS - skip whichever block doesn't apply.
+Below are per-OS commands to install **both** dependencies - skip whichever block doesn't apply.
 
 ```bash
-# macOS (also installs hcl2json in one go)
+# macOS (Homebrew installs both in one go)
 brew install node hcl2json
 
-# Ubuntu / Debian (apt-based)
+# Ubuntu / Debian (apt-based): Node, then the hcl2json binary
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
+curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
+sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
 
-# Other Linux (RHEL/Fedora)
+# Other Linux (RHEL/Fedora): same hcl2json binary (pick arm64 if needed)
 curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash -
 sudo dnf install -y nodejs    # or: sudo yum install -y nodejs
+curl -fsSL -o /tmp/hcl2json https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_linux_amd64
+sudo install -m 0755 /tmp/hcl2json /usr/local/bin/hcl2json
 
-# Other Linux (Arch)
-sudo pacman -S nodejs npm
-
-# Other Linux (Alpine)
-sudo apk add nodejs npm
+# Other Linux (Arch / Alpine): pacman/apk for Node, then the hcl2json binary above
+sudo pacman -S nodejs npm        # Arch
+sudo apk add nodejs npm          # Alpine
 ```
 
 ```powershell
-# Windows (PowerShell)
+# Windows (PowerShell): Node via winget, hcl2json via direct download
 winget install OpenJS.NodeJS.LTS
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser   # required for npm.ps1 on fresh installs
+
+$dest = "$env:USERPROFILE\bin"; New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri "https://github.com/tmccombs/hcl2json/releases/latest/download/hcl2json_windows_amd64.exe" -OutFile "$dest\hcl2json.exe"
+$env:Path = "$dest;$env:Path"
 ```
 
 > **If `Set-ExecutionPolicy` fails** with a Group Policy error (common on managed machines), run a single command via `cmd /c npm ...` or `powershell -ExecutionPolicy Bypass -Command "..."`. WSL is also fine - install via the Ubuntu/Debian instructions inside the WSL shell, and keep your Terraform tree in the WSL filesystem (`~/...`) rather than `/mnt/c/...` for performance.
@@ -243,14 +237,6 @@ After cloning, `git pull && npm run build` is enough to pick up upstream changes
 | `pdf` | Paginated, server-side via [`pdfkit`](https://pdfkit.org/) - no headless Chromium. Layout mirrors HTML. **Recommended for sharing with auditors** and over channels where HTML is awkward. On Windows, PDF avoids the SmartScreen warning that HTML opened from UNC paths (`\\wsl.localhost\...`) triggers |
 | `json` | Machine-readable. Each finding includes `ruleId`, `status`, `description`, `remediation`, and `regulatoryReference` / `nistReference` / `isoReference` |
 | `sarif` | SARIF 2.1.0 - OASIS standard consumed by GitHub Code Scanning, Azure DevOps, GitLab, and the VS Code SARIF Viewer (see [SARIF and GitHub Code Scanning](#sarif-and-github-code-scanning)) |
-
-### Sample reports
-
-Page 1 of two real scans, generated with `--format pdf`:
-
-| `sample-chat-bedrock` (small, focused stack) | `infrastructure` (large multi-stack estate) |
-| --- | --- |
-| [![Bedrock chat sample report](docs/samples/sample-report-bedrock.png)](docs/samples/sample-report-bedrock.png) | [![Multi-stack infrastructure sample report](docs/samples/sample-report-infrastructure.png)](docs/samples/sample-report-infrastructure.png) |
 
 ---
 

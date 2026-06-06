@@ -592,3 +592,131 @@ describe('parsePlanObject - child module outputs', () => {
     expect(overlay.outputs.has('module.shared.missing')).toBe(false);
   });
 });
+
+describe('parsePlanObject - configuration reference graph', () => {
+  // Mirrors the real cross-module wiring: an agent in module recruiter_api
+  // attaches a guardrail declared in module bedrock_governance, plumbed through
+  // module outputs and the call-site var binding.
+  const planWithModuleWiring = {
+    format_version: '1.2',
+    terraform_version: '1.7.5',
+    configuration: {
+      root_module: {
+        module_calls: {
+          recruiter_api: {
+            expressions: {
+              guardrail_identifier: {
+                references: [
+                  'module.bedrock_governance.guardrail_identifier',
+                  'module.bedrock_governance',
+                ],
+              },
+              guardrail_version: {
+                references: [
+                  'module.bedrock_governance.guardrail_version',
+                  'module.bedrock_governance',
+                ],
+              },
+            },
+            module: {
+              resources: [
+                {
+                  address: 'aws_bedrockagent_agent.recruiter',
+                  type: 'aws_bedrockagent_agent',
+                  name: 'recruiter',
+                  expressions: {
+                    guardrail_configuration: {
+                      references: ['var.guardrail_identifier', 'var.guardrail_version'],
+                    },
+                  },
+                },
+              ],
+            },
+          },
+          bedrock_governance: {
+            expressions: {},
+            module: {
+              outputs: {
+                guardrail_identifier: {
+                  expression: {
+                    references: [
+                      'aws_bedrock_guardrail.recruiter.guardrail_arn',
+                      'aws_bedrock_guardrail.recruiter',
+                    ],
+                  },
+                },
+                guardrail_version: {
+                  expression: {
+                    references: [
+                      'aws_bedrock_guardrail_version.recruiter.version',
+                      'aws_bedrock_guardrail_version.recruiter',
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+
+  it('records resource-attribute references qualified to the module scope', () => {
+    const overlay = parsePlanObject(planWithModuleWiring);
+    expect(overlay.configReferences).toBeDefined();
+    expect(
+      overlay.configReferences!.resourceAttrs.get(
+        'module.recruiter_api.aws_bedrockagent_agent.recruiter#guardrail_configuration',
+      ),
+    ).toEqual([
+      'var:module.recruiter_api::guardrail_identifier',
+      'var:module.recruiter_api::guardrail_version',
+    ]);
+  });
+
+  it('binds module-call inputs (var.X) to their call-site references', () => {
+    const overlay = parsePlanObject(planWithModuleWiring);
+    expect(
+      overlay.configReferences!.varBindings.get('module.recruiter_api::guardrail_identifier'),
+    ).toEqual(['out:module.bedrock_governance.guardrail_identifier']);
+  });
+
+  it('records module outputs pointing at terminal resources', () => {
+    const overlay = parsePlanObject(planWithModuleWiring);
+    expect(
+      overlay.configReferences!.moduleOutputs.get('module.bedrock_governance.guardrail_identifier'),
+    ).toEqual(['res:aws_bedrock_guardrail.recruiter']);
+    expect(
+      overlay.configReferences!.moduleOutputs.get('module.bedrock_governance.guardrail_version'),
+    ).toEqual(['res:aws_bedrock_guardrail_version.recruiter']);
+  });
+
+  it('is undefined when the plan carries no configuration block', () => {
+    const overlay = parsePlanObject({ format_version: '1.2', terraform_version: '1.7.5' });
+    expect(overlay.configReferences).toBeUndefined();
+  });
+
+  it('drops references that are not resource/output/var chains (locals, data)', () => {
+    const overlay = parsePlanObject({
+      format_version: '1.2',
+      terraform_version: '1.7.5',
+      configuration: {
+        root_module: {
+          resources: [
+            {
+              address: 'aws_bedrockagent_agent.bot',
+              type: 'aws_bedrockagent_agent',
+              name: 'bot',
+              expressions: {
+                guardrail_configuration: {
+                  references: ['local.gr', 'data.aws_x.y.id', 'count.index'],
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    expect(overlay.configReferences).toBeUndefined();
+  });
+});

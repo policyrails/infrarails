@@ -24,4 +24,17 @@ resource "aws_bedrock_guardrail" "safety" {
   name                      = "safety"
   blocked_input_messaging   = "blocked"
   blocked_outputs_messaging = "blocked"
+
+  content_policy_config {
+    filters_config {
+      type            = "PROMPT_ATTACK"
+      input_strength  = "HIGH"
+      output_strength = "NONE"
+    }
+    filters_config {
+      type            = "HATE"
+      input_strength  = "HIGH"
+      output_strength = "HIGH"
+    }
+  }
 }

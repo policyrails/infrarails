@@ -5,7 +5,7 @@ export const s3EncryptionRule: ScanRule = {
   id: 'S-12.x.2a',
   description: 'S3 log bucket must use KMS encryption',
   severity: 'FAIL',
-  regulatoryReference: 'EU AI Act Article 12 - Integrity and confidentiality of logs',
+  regulatoryReference: 'EU AI Act Article 15(5) - cybersecurity, incl. resilience to confidentiality attacks (KMS protects log confidentiality at rest); Article 12(2) - traceability of access to AI system logs (KMS Decrypt emits per-principal CloudTrail audit events)',
   nistReference: 'NIST AI RMF 1.0: MEASURE 2.7 (security and resilience); MEASURE 2.10 (privacy of AI system data)',
   isoReference: 'ISO/IEC 42001:2023 Annex A: A.6.2.8 (AI system event logs); A.7.4 (Quality of data - integrity protection)',
 

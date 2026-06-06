@@ -81,6 +81,77 @@ describe('formatJson', () => {
     expect(parsed.findings[0].isoReference).toContain('A.6.2.8');
   });
 
+  it('splits a multi-article EU citation into one numbers-only pill per article (paren form)', () => {
+    // Regression: the EU parser used to split on the first " - ", but a dash can
+    // sit *inside* a parenthesised description (e.g. S-9.x.3). That truncated the
+    // first pill to "Art. 9(2)(d) (appropriate and targeted..." and silently
+    // dropped Art. 9(5)(b), 15(4), 15(5) entirely.
+    const findings: Finding[] = [
+      {
+        ruleId: 'S-9.x.3',
+        status: 'WARN',
+        filePath: 'test.tf',
+        description: 'guardrail body',
+        remediation: '',
+        regulatoryReference:
+          'EU AI Act Art. 9(2)(d) (appropriate and targeted risk management measures - ' +
+          'applies where the system is high-risk under Art. 6/Annex III); ' +
+          'Art. 9(5)(b) (adequate mitigation and control measures for risks that cannot ' +
+          'be eliminated by design); ' +
+          'Art. 15(4) (resilience to errors and inconsistencies - anchors the contextual ' +
+          'grounding surface, i.e. hallucination resistance); ' +
+          'Art. 15(5) ¶3 (adversarial examples / model evasion and confidentiality attacks ' +
+          '- PROMPT_ATTACK filter and PII BLOCK respectively)',
+      },
+    ];
+
+    const parsed = JSON.parse(formatJson(findings));
+    const eu = parsed.findings[0].frameworks.find(
+      (g: { framework: string }) => g.framework === 'EU AI Act',
+    );
+
+    // Pills are numbers only - no prose, no stray open paren.
+    expect(eu.items.map((i: { id: string }) => i.id)).toEqual([
+      'Art. 9(2)(d)',
+      'Art. 9(5)(b)',
+      'Art. 15(4)',
+      'Art. 15(5) ¶3',
+    ]);
+    // Prose is preserved for the hover tooltip, not lost.
+    expect(eu.items[0].desc).toContain('appropriate and targeted risk management measures');
+    expect(eu.items[3].desc).toContain('PROMPT_ATTACK');
+  });
+
+  it('keeps every article when an EU citation lists several in dash form', () => {
+    // s3-versioning / s3-encryption cite two articles; the second used to be dropped.
+    const findings: Finding[] = [
+      {
+        ruleId: 'S-12.x.1',
+        status: 'PASS',
+        filePath: 'test.tf',
+        description: 'versioning',
+        remediation: '',
+        regulatoryReference:
+          'EU AI Act Article 19(1) - Logs must be kept intact for at least six months ' +
+          '(versioning/Object Lock preserves them against silent overwrite or deletion); ' +
+          'Article 15(5) - resilience against unauthorised alteration of system outputs',
+      },
+    ];
+
+    const parsed = JSON.parse(formatJson(findings));
+    const eu = parsed.findings[0].frameworks.find(
+      (g: { framework: string }) => g.framework === 'EU AI Act',
+    );
+
+    expect(eu.items).toEqual([
+      {
+        id: 'Article 19(1)',
+        desc: 'Logs must be kept intact for at least six months (versioning/Object Lock preserves them against silent overwrite or deletion)',
+      },
+      { id: 'Article 15(5)', desc: 'resilience against unauthorised alteration of system outputs' },
+    ]);
+  });
+
   it('should omit frameworks entries with no parsed items', () => {
     const findings: Finding[] = [
       {

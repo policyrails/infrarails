@@ -68,7 +68,23 @@ export function resolveExpression(
         expr,
         overlay,
       );
-      if (overlayResult) return overlayResult;
+      if (overlayResult) {
+        // A concrete plan value is the most precise answer - prefer it.
+        if (overlayResult.kind === 'literal') return overlayResult;
+        // Otherwise the plan only reports that the *value* is computed-at-apply
+        // (after_unknown) or sensitive - it has not changed *which* resource this
+        // reference points at. When that resource is actually declared in the
+        // scanned HCL we trust the HCL-derived identity (its address) rather than
+        // degrading to INCONCLUSIVE, so address-based matching (log bucket / log
+        // group) works under --plan exactly as it does for a source-only scan.
+        // With no HCL to anchor on, keep the plan's honest unknown/sensitive
+        // verdict. See CLAUDE.md "HCL-anchored resolution".
+        if (awsResourceDeclared(resourceType, resourceName, files)) {
+          const staticResult = resolveAwsRef(resourceType, resourceName, attribute, files);
+          if (staticResult.kind === 'address') return staticResult;
+        }
+        return overlayResult;
+      }
     }
     return resolveAwsRef(resourceType, resourceName, attribute, files);
   }
@@ -337,6 +353,24 @@ function resolveAwsRef(
   // Resource not present in scanned files - still return its address so downstream
   // matching by address can succeed if the resource is defined elsewhere.
   return { kind: 'address', value: `${resourceType}.${resourceName}`, resourceType, resourceName };
+}
+
+/**
+ * True when `<resourceType>.<resourceName>` is declared in any scanned HCL file.
+ * Used to decide whether an HCL-derived resource address is trustworthy enough
+ * to override a plan's known-after-apply / sensitive verdict (the "anchor on HCL
+ * only when it is accurate" rule).
+ */
+function awsResourceDeclared(
+  resourceType: string,
+  resourceName: string,
+  files: ParsedFile[],
+): boolean {
+  for (const file of files) {
+    const typeBlock = file.json.resource?.[resourceType];
+    if (typeBlock && typeBlock[resourceName] !== undefined) return true;
+  }
+  return false;
 }
 
 /**

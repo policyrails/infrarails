@@ -1,0 +1,102 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.7.5",
+  "planned_values": {
+    "root_module": {
+      "resources": [
+        {
+          "address": "aws_cloudtrail.main",
+          "type": "aws_cloudtrail",
+          "name": "main",
+          "values": {
+            "name": "ai-audit-trail",
+            "s3_bucket_name": "some-trail-bucket",
+            "enable_logging": true
+          }
+        }
+      ],
+      "child_modules": [
+        {
+          "address": "module.logging",
+          "resources": [
+            {
+              "address": "module.logging.aws_s3_bucket.logs",
+              "type": "aws_s3_bucket",
+              "name": "logs",
+              "values": { "bucket": null }
+            },
+            {
+              "address": "module.logging.aws_s3_bucket_versioning.logs",
+              "type": "aws_s3_bucket_versioning",
+              "name": "logs",
+              "values": {
+                "versioning_configuration": [{ "status": "Enabled" }]
+              }
+            },
+            {
+              "address": "module.logging.aws_s3_bucket_server_side_encryption_configuration.logs",
+              "type": "aws_s3_bucket_server_side_encryption_configuration",
+              "name": "logs",
+              "values": {
+                "rule": [
+                  {
+                    "apply_server_side_encryption_by_default": [
+                      { "sse_algorithm": "aws:kms" }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "address": "module.logging.aws_s3_bucket_lifecycle_configuration.logs",
+              "type": "aws_s3_bucket_lifecycle_configuration",
+              "name": "logs",
+              "values": {
+                "rule": [
+                  {
+                    "id": "expire-bedrock-logs",
+                    "status": "Enabled",
+                    "expiration": [{ "days": 90 }]
+                  }
+                ]
+              }
+            },
+            {
+              "address": "module.logging.aws_bedrock_model_invocation_logging_configuration.this",
+              "type": "aws_bedrock_model_invocation_logging_configuration",
+              "name": "this",
+              "values": {
+                "logging_config": {
+                  "text_data_delivery_enabled": true,
+                  "s3_config": { "key_prefix": "bedrock" }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "resource_changes": [
+    {
+      "address": "module.logging.aws_s3_bucket.logs",
+      "type": "aws_s3_bucket",
+      "name": "logs",
+      "change": {
+        "actions": ["create"],
+        "after_unknown": { "bucket": true, "id": true, "arn": true }
+      }
+    },
+    {
+      "address": "module.logging.aws_bedrock_model_invocation_logging_configuration.this",
+      "type": "aws_bedrock_model_invocation_logging_configuration",
+      "name": "this",
+      "change": {
+        "actions": ["create"],
+        "after_unknown": {
+          "logging_config": [{ "s3_config": [{ "bucket_name": true }] }]
+        }
+      }
+    }
+  ]
+}

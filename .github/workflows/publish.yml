@@ -49,8 +49,16 @@ jobs:
       - name: Bump version
         id: bump
         run: |
-          npm version "${{ inputs.version }}" -m "chore(release): v%s"
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          current=$(node -p "require('./package.json').version")
+          target="${{ inputs.version }}"
+          if [ "$current" = "$target" ]; then
+            echo "package.json is already at v$current; tagging without re-bumping."
+            git tag -a "v$current" -m "chore(release): v$current"
+            echo "version=$current" >> "$GITHUB_OUTPUT"
+          else
+            npm version "$target" -m "chore(release): v%s"
+            echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Pack (dry run preview)
         run: npm pack --dry-run

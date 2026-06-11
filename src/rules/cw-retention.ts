@@ -1,5 +1,5 @@
 import { ScanRule, Finding, ParsedFile, PlanOverlay, ScanContext, UnresolvableReason } from '../types';
-import { findResources, findResourceLine, getNestedValue, inconclusiveFromUnresolved } from '../utils/resource-helpers';
+import { findResources, findResourceLine, getNestedValue, inconclusiveFromUnresolved, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 import { resolveExpression, resolveOrPlanFallback, resolveScalarReference } from '../resolver';
 import { isUnresolvedScalar } from '../utils/literal';
 
@@ -32,13 +32,13 @@ const RETENTION_RATIONALE =
 // the message based on whether a subscription filter was found in the scanned
 // Terraform.
 const FORWARDER_NOTE_WHEN_FOUND =
-  'A CloudWatch subscription filter was found in the scanned Terraform - ' +
+  'A CloudWatch subscription filter was found in the scanned IaC - ' +
   'logs may be forwarded to an external system (Datadog, Splunk, SIEM) where ' +
   'retention is satisfied. Verify the destination retention; this scanner ' +
   'cannot follow the chain past the subscription filter.';
 
 const FORWARDER_NOTE_WHEN_MISSING =
-  'No CloudWatch subscription filter was found in the scanned Terraform, but ' +
+  'No CloudWatch subscription filter was found in the scanned IaC, but ' +
   'forwarders are commonly owned by a separate platform repo (Datadog/Splunk ' +
   'forwarder Lambda, central log-archive account, auto-subscription Lambda). ' +
   'If logs are forwarded out-of-repo, verify retention at the destination. ' +
@@ -155,8 +155,8 @@ export const cwRetentionRule: ScanRule = {
           status: escalate ? 'FAIL' : 'WARN',
           filePath: '',
           description: escalate
-            ? `CloudWatch log group "${targetName}" is referenced by Bedrock invocation logging but not declared in any scanned Terraform file, and no CloudWatch subscription filter forwards it out-of-repo. (Strict account-logging mode: missing log group with no forwarder treated as FAIL.)`
-            : `CloudWatch log group "${targetName}" is referenced by Bedrock invocation logging but not declared in any scanned Terraform file - its retention is not under this repo's IaC control.`,
+            ? `CloudWatch log group "${targetName}" is referenced by Bedrock invocation logging but not declared in any scanned IaC file, and no CloudWatch subscription filter forwards it out-of-repo. (Strict account-logging mode: missing log group with no forwarder treated as FAIL.)`
+            : `CloudWatch log group "${targetName}" is referenced by Bedrock invocation logging but not declared in any scanned IaC file - its retention is not under this repo's IaC control.`,
           remediation:
             `Either declare an aws_cloudwatch_log_group resource for "${targetName}" with ` +
             `retention_in_days >= ${MIN_RETENTION_DAYS} (recommended: ${RECOMMENDED_RETENTION_DAYS}), ` +
@@ -173,6 +173,21 @@ export const cwRetentionRule: ScanRule = {
       const retention = getNestedValue(matching.body, 'retention_in_days');
       let retentionDays = typeof retention === 'number' ? retention : undefined;
       const line = findResourceLine(matching.rawHcl, 'aws_cloudwatch_log_group', matching.name);
+
+      // Condition-guarded CFN log group: it (and its retention) may not exist
+      // at deploy time, so neither PASS nor WARN/FAIL is honest.
+      const condition = cfnConditionOf(matching.body);
+      if (condition) {
+        findings.push(
+          inconclusiveConditional(this, {
+            label: `CloudWatch log group "${targetName}"`,
+            condition,
+            filePath: matching.filePath,
+            line,
+          }),
+        );
+        continue;
+      }
 
       // retention_in_days driven by a var/local reference - try to resolve it
       // against same-module variable defaults / locals before giving up. This

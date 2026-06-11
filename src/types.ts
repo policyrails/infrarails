@@ -40,7 +40,16 @@ export type UnresolvableReason =
   | 'plan-sensitive-redacted'
   | 'plan-deferred-data-source'
   | 'plan-remote-state-unreachable'
-  | 'plan-instances-divergent';
+  | 'plan-instances-divergent'
+  // CloudFormation-specific reasons. Produced by the CFN normaliser's sentinel
+  // expressions (src/cfn/intrinsics.ts) and by the Condition handling; none of
+  // them are escalatable under --plan --strict-account-logging because the
+  // plan overlay is Terraform-only and cannot resolve them.
+  | 'cfn-import-value'
+  | 'cfn-dynamic-reference'
+  | 'cfn-pseudo-parameter'
+  | 'cfn-fn-not-static'
+  | 'cfn-condition-gated';
 
 export interface UnresolvedRef {
   expression: string;

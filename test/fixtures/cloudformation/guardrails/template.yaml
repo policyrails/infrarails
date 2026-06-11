@@ -1,0 +1,45 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Bedrock agent with a strong, versioned guardrail and CloudTrail enabled.
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  StrongGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub 'support-guardrail-${Env}'
+      BlockedInputMessaging: Sorry, I cannot help with that.
+      BlockedOutputsMessaging: Sorry, I cannot help with that.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+
+  StrongGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt StrongGuardrail.GuardrailId
+      Description: pinned v1
+
+  SupportAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: support-agent
+      FoundationModel: anthropic.claude-3-5-sonnet-20241022-v2:0
+      GuardrailConfiguration:
+        GuardrailIdentifier: !GetAtt StrongGuardrail.GuardrailId
+        GuardrailVersion: '1'
+
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      IsLogging: true
+      S3BucketName: org-audit-trail-bucket
+      IsMultiRegionTrail: true

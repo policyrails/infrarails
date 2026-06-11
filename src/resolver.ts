@@ -21,6 +21,17 @@ const REMOTE_STATE_REF = /^data\.terraform_remote_state\.([a-z0-9_]+)\.outputs\.
 //   module.outer.module.inner.x
 const MODULE_REF = /^(?:module\.[a-z0-9_]+(?:\[[^\]]+\])?\.)+\w+$/i;
 
+// CFN sentinel slug -> UnresolvableReason. 'complex' reuses the TF
+// complex-interpolation reason (an Fn::Join/FindInMap that mixes static and
+// dynamic pieces is the same situation as a composite TF interpolation).
+const CFN_SENTINEL_REASONS: Record<string, UnresolvableReason> = {
+  'import-value': 'cfn-import-value',
+  'dynamic-reference': 'cfn-dynamic-reference',
+  'pseudo-parameter': 'cfn-pseudo-parameter',
+  'fn-not-static': 'cfn-fn-not-static',
+  complex: 'complex-interpolation',
+};
+
 /**
  * Resolve a Terraform expression into one of three outcomes:
  *   - literal:      a concrete string value we can compare against
@@ -55,6 +66,17 @@ export function resolveExpression(
   }
 
   const inner = interpMatch ? interpMatch[1] : expr;
+
+  // CFN normaliser sentinel: ${cfn:<reason-slug>:<detail>} marks a value only
+  // CloudFormation can resolve at deploy time (Fn::ImportValue, dynamic
+  // references, pseudo parameters, non-static intrinsics). Mapped to a precise
+  // reason so findings explain the CFN-specific cause. Never produced by
+  // Terraform input, so this match cannot shadow a real TF expression.
+  const cfnMatch = inner.match(/^cfn:([a-z-]+):/);
+  if (cfnMatch) {
+    const reason = CFN_SENTINEL_REASONS[cfnMatch[1]] ?? 'unknown-format';
+    return { kind: 'unresolvable', expression: expr, reason, sourceField };
+  }
 
   // aws_<type>.<name>.<attr>
   const awsMatch = inner.match(AWS_RES_REF);
@@ -638,5 +660,15 @@ export function explainReason(reason: UnresolvableReason): string {
       return 'terraform_remote_state backend was unreachable at plan time.';
     case 'plan-instances-divergent':
       return 'plan contains multiple instances of this resource with differing values for the referenced attribute - reference an explicit index (e.g. `aws_X.y[0]`) or restructure the expression.';
+    case 'cfn-import-value':
+      return 'value is imported from another CloudFormation stack (Fn::ImportValue) and is not visible to source-level scanning.';
+    case 'cfn-dynamic-reference':
+      return 'value is fetched from SSM Parameter Store / Secrets Manager at deploy time via a CloudFormation dynamic reference.';
+    case 'cfn-pseudo-parameter':
+      return 'value depends on a CloudFormation pseudo parameter (AWS::Region, AWS::AccountId, ...) resolved at deploy time.';
+    case 'cfn-fn-not-static':
+      return 'value is built by a CloudFormation intrinsic function that cannot be evaluated statically.';
+    case 'cfn-condition-gated':
+      return 'resource is created conditionally (CloudFormation Condition); static scanning cannot determine whether it will exist at deploy time.';
   }
 }

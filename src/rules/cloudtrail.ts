@@ -4,6 +4,9 @@ import {
   findResourceLine,
   getNestedValue,
   findBaselineRemoteState,
+  findCfnBaselineImports,
+  cfnConditionOf,
+  inconclusiveConditional,
 } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 
@@ -37,6 +40,18 @@ export const cloudtrailRule: ScanRule = {
       return trails.map((trail) => {
         const enableLogging = getNestedValue(trail.body, 'enable_logging');
         const line = findResourceLine(trail.rawHcl, 'aws_cloudtrail', trail.name);
+
+        // A Condition-guarded CFN trail may not exist at deploy time - its
+        // properties cannot prove anything either way.
+        const condition = cfnConditionOf(trail.body);
+        if (condition) {
+          return inconclusiveConditional(this, {
+            label: `CloudTrail "${trail.name}"`,
+            condition,
+            filePath: trail.filePath,
+            line,
+          });
+        }
 
         // enable_logging defaults to true in the AWS provider if not set.
         if (enableLogging === false) {
@@ -87,10 +102,15 @@ export const cloudtrailRule: ScanRule = {
 
     // No trail in scanned files. Check for baseline-stack evidence first -
     // a data.terraform_remote_state.account_baseline / audit / security / etc.
+    // (or the CFN equivalent: Fn::ImportValue of a baseline-named export)
     // strongly implies the trail lives in a separate stack that wasn't scanned.
     const baselineHints = findBaselineRemoteState(files);
-    if (baselineHints.length > 0) {
-      const refs = baselineHints.map((h) => h.dataAddress).join(', ');
+    const cfnImportHints = findCfnBaselineImports(files);
+    if (baselineHints.length > 0 || cfnImportHints.length > 0) {
+      const refs = [
+        ...baselineHints.map((h) => h.dataAddress),
+        ...cfnImportHints.map((h) => `Fn::ImportValue "${h.importName}"`),
+      ].join(', ');
       return [
         {
           ruleId: this.id,

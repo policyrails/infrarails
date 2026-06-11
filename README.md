@@ -33,9 +33,21 @@ Color-coded findings grouped by status, each cross-referenced to the **EU AI Act
 
 ---
 
+## 🔭 Coming next: drift attestation - proof it *stays* compliant
+
+A passing scan proves your Terraform **declared** the right controls. The next infrarails layer proves your deployed infrastructure **stays** that way:
+
+> **Continuous "no drift since deployment" attestation** - cryptographically signed, write-once evidence that the infrastructure you scanned is the infrastructure still running. Out-of-band changes are recorded with who/when attribution - **even when they're reverted before anyone looks.**
+
+Built for the same person the PDF reports are built for: the one who has to hand an auditor *evidence*, not screenshots.
+
+**Status: in private development.** Star or watch this repo for the announcement, or open an issue titled `attest: early access` to join the early-access list.
+
+---
+
 ## What is this?
 
-`infrarails` is built for teams running **high-risk AI systems on AWS Bedrock**, and for teams voluntarily adopting Article 9 / Article 12-equivalent controls under **NIST AI RMF** or **ISO/IEC 42001**. It reads your **Terraform HCL** (and `.tf.json` files emitted by cdktf, Terragrunt, and similar generators) and reports exactly which infrastructure-layer controls are passing, failing, or cannot be verified statically - no deploy required.
+`infrarails` is built for teams running **high-risk AI systems on AWS Bedrock**, and for teams voluntarily adopting Article 9 / Article 12-equivalent controls under **NIST AI RMF** or **ISO/IEC 42001**. It reads your **Terraform HCL** (and `.tf.json` files emitted by cdktf, Terragrunt, and similar generators) **and your CloudFormation templates** (YAML/JSON, including SAM and `cdk synth` output) and reports exactly which infrastructure-layer controls are passing, failing, or cannot be verified statically - no deploy required. Every rule runs against both dialects; mixed directories Just Work.
 
 Each finding is cross-referenced against:
 
@@ -46,6 +58,27 @@ Each finding is cross-referenced against:
 The scanner is **deliberately conservative**: when it cannot prove a control is in place, it emits `INCONCLUSIVE` rather than `PASS` or `FAIL`. For a compliance tool, "we couldn't verify" is the only honest answer when evidence is split across stacks, modules, or runtime values.
 
 > **Prerequisite, not a certificate.** A fully passing run is a **necessary but not sufficient** condition for EU AI Act / NIST AI RMF / ISO 42001 conformance. `infrarails` only verifies that a narrow set of AWS Bedrock infrastructure primitives are **declared** in your Terraform - it does not evaluate organisational, procedural, application-level, or runtime controls. See the [Disclaimer](#disclaimer) for the full scope statement.
+
+---
+
+## Supported inputs
+
+| Input | Files | How |
+|---|---|---|
+| Terraform | `.tf`, `.tf.json` | Native (via `hcl2json`) |
+| CloudFormation | `.yaml`, `.yml`, `.json` | Normalised into the same internal shape; every rule runs unchanged |
+| Mixed directories | any of the above | Auto-detected per file - a Terraform module next to a SAM template scans as one estate |
+
+Detection is by extension **plus content shape**: a `.json` is CloudFormation only if it declares `AWSTemplateFormatVersion`, a `Transform`, or a `Resources` map of `AWS::*` types - a `package.json` or Kubernetes manifest is skipped, never misparsed. Force one dialect in CI with `--input tf` or `--input cfn` (default `auto`). A malformed file that plausibly *is* a CFN template is a hard error (exit `2`), not a silent skip. Mixed-source terminal reports tag each finding with a `[terraform]` / `[cloudformation]` chip.
+
+CloudFormation specifics the scanner is honest about:
+
+- **Intrinsics** are resolved when static (`!Ref` to a parameter with a `Default`, all-static `!Sub`/`!Join`/`!FindInMap`/`!Select`/`!Split`/`!Base64`) and reported as `INCONCLUSIVE` with a precise reason when not: `Fn::ImportValue` (`cfn-import-value`), `{{resolve:ssm:...}}` dynamic references (`cfn-dynamic-reference`), pseudo parameters (`cfn-pseudo-parameter`), `Fn::If` and friends (`cfn-fn-not-static`).
+- **`Conditions` are never evaluated.** A resource guarded by `Condition:` may not exist at deploy time, so rules report it `INCONCLUSIVE` (`cfn-condition-gated`) rather than trusting its properties.
+- **Bedrock invocation logging cannot be declared in CloudFormation** - there is no CFN resource type for it (AWS's own pattern uses a Lambda-backed custom resource). When all Bedrock usage comes from CFN templates and no logging config is in scope, `S-12.1.1` stays `INCONCLUSIVE` (even under `--strict-account-logging`) and the remediation points at `PutModelInvocationLoggingConfiguration` / a Terraform stack.
+- **Nested stacks** (`AWS::CloudFormation::Stack`) are treated like remote Terraform modules: not fetched, flagged by `S-12.x.5` when they look Bedrock-related. `Fn::ImportValue` of a baseline-named export counts as cross-stack evidence the same way `terraform_remote_state` does.
+- **`--plan` stays Terraform-only.** CloudFormation change sets are a separate, future feature.
+- **CDK users:** scan the synthesized output (`cdk synth > template.yaml`), not the CDK source.
 
 ---
 
@@ -94,6 +127,10 @@ The hardest part of static compliance scanning isn't matching resource types - i
 | Remote modules (registry/git/http/bitbucket) - no plan | Flagged via `S-12.x.5`; `S-12.1.1` emits `INCONCLUSIVE` rather than misleading `SKIP` if Bedrock might live inside |
 | Remote modules - with `--plan` | Resources visible via `planned_values.child_modules[]`; rules evaluate them directly, `S-12.x.5` auto-SKIPs |
 | `.tf.json` (cdktf, Terragrunt) | Parsed alongside `.tf` - same internal representation |
+| CloudFormation template with inline S3 bucket config | Bucket split into the TF-shaped companion resources (encryption/versioning/lifecycle/object-lock) so the same S3 rules evaluate it |
+| CFN resource guarded by `Condition:` | `INCONCLUSIVE` (`cfn-condition-gated`) - the control may not exist at deploy time |
+| CFN-only Bedrock usage, no logging config | `S-12.1.1: INCONCLUSIVE` explaining CFN cannot declare invocation logging (no FAIL, even in strict mode) |
+| Nested stack (`AWS::CloudFormation::Stack`) that looks Bedrock-related | Flagged via `S-12.x.5`, like a remote Terraform module |
 
 **Bedrock Guardrails - Agent-attached vs SDK runtime.**
 
@@ -136,6 +173,7 @@ infrarails <directory> [options]
 | `--no-strict` | strict on | Treat `INCONCLUSIVE` as non-blocking. By default INCONCLUSIVE blocks the exit code like FAIL - for a compliance tool, "we couldn't verify" should not silently pass a CI gate. |
 | `--strict-account-logging` | off | Asserts the scanned tree is the entire estate. Three escalations: (1) missing logging config → `FAIL`; (2) `S-12.1.2a` retention findings → `FAIL` when no subscription filter is found; (3) with `--plan`, user-fixable INCONCLUSIVEs → `FAIL` (see [Audit-grade scan with `--plan`](#audit-grade-scan-with---plan)). |
 | `--plan <file>` | - | Path to Terraform plan JSON (`terraform show -json tfplan.bin`). Resolves expressions and exposes resources inside remote modules. **Plan files contain resolved variable values - treat as ephemeral.** Full workflow, caveats, and `-target` warning: see [Audit-grade scan with `--plan`](#audit-grade-scan-with---plan). |
+| `--input <mode>` | `auto` | Input dialect: `auto` detects per file; `tf` scans Terraform only; `cfn` scans CloudFormation only. Use the forced modes in CI pipelines that need a hard guarantee about what was scanned. |
 | `--version`, `-h` | - | Version / help |
 
 ### Exit codes

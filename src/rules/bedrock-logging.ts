@@ -8,6 +8,7 @@ import {
   findBedrockDataSources,
   findIamBedrockGrants,
   findBedrockVpcEndpoints,
+  isCfnTemplatePath,
 } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 
@@ -100,6 +101,24 @@ export const bedrockLoggingRule: ScanRule = {
         ];
       }
       return [buildRemoteModuleInconclusive(this.id, remoteModules)];
+    }
+
+    // All Bedrock-usage signals come from CloudFormation templates. CFN has
+    // no resource type for Bedrock model invocation logging (the TF
+    // aws_bedrock_model_invocation_logging_configuration has no CFN
+    // counterpart - AWS's own guidance uses a Lambda-backed custom resource
+    // calling the API), so the scanned templates *cannot* declare it. The
+    // honest verdict is INCONCLUSIVE - even under --strict-account-logging,
+    // because logging may be configured via the API/console/custom resource
+    // and a FAIL would demand a fix CFN cannot express.
+    const signalPaths = [
+      ...direct.map((d) => d.filePath),
+      ...indirect.iam.map((g) => g.filePath),
+      ...indirect.vpc.map((v) => v.filePath),
+      ...indirect.dataSources.map((d) => d.filePath),
+    ];
+    if (signalPaths.length > 0 && signalPaths.every((p) => isCfnTemplatePath(p))) {
+      return [buildCfnLoggingGapInconclusive(this.id, direct, indirect, hasAgent, agentNames)];
     }
 
     // Indirect-only signals (IAM / VPC / data source) and no logging.
@@ -234,6 +253,36 @@ function buildRemoteModuleInconclusive(
     filePath: '',
     description: `No Bedrock resources found in scanned files, but remote module(s) ${names} could not be inspected. Bedrock usage and logging config may be defined inside those modules.`,
     remediation: RUN_PLAN_HINT,
+    regulatoryReference: REGULATORY_REFERENCE,
+    nistReference: NIST_REFERENCE,
+    isoReference: ISO_REFERENCE,
+  };
+}
+
+function buildCfnLoggingGapInconclusive(
+  ruleId: string,
+  direct: DirectUsage[],
+  indirect: IndirectUsage,
+  hasAgent: boolean,
+  agentNames: string[],
+): Finding {
+  const usageSummary = describeUsage(direct, indirect);
+  return {
+    ruleId,
+    status: 'INCONCLUSIVE',
+    filePath: direct[0]?.filePath ?? '',
+    description:
+      `${usageSummary} Bedrock usage was detected in CloudFormation template(s), but ` +
+      `CloudFormation has no resource type for Bedrock model invocation logging, so the ` +
+      `scanned templates cannot declare it. Whether logging is enabled cannot be ` +
+      `determined from these files.`,
+    remediation:
+      'Enable Bedrock invocation logging outside CloudFormation: via the console/API ' +
+      '(PutModelInvocationLoggingConfiguration), a Lambda-backed custom resource, or a ' +
+      'Terraform stack declaring aws_bedrock_model_invocation_logging_configuration. ' +
+      'Verify with "aws bedrock get-model-invocation-logging-configuration". If a ' +
+      'Terraform stack manages it, scan that directory too.' +
+      agentRemediationAddendum(hasAgent, agentNames),
     regulatoryReference: REGULATORY_REFERENCE,
     nistReference: NIST_REFERENCE,
     isoReference: ISO_REFERENCE,

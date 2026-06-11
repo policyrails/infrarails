@@ -23,6 +23,9 @@ This document describes the internal pipeline of `infrarails`. For installation,
    |     Parser       |                  |
    |  .tf  -> hcl2json|                  |
    |  .tf.json -> JSON|                  |
+   |  .yaml/.yml/.json|                  |
+   |   -> CFN         |                  |
+   |      normaliser  |   src/cfn/*      |
    +--------+---------+                  |
             | ParsedFile[]               |
             v                            v
@@ -68,6 +71,25 @@ The parser ([src/parser.ts](src/parser.ts)) invokes `hcl2json` via `spawnSync('h
 - **No quote-escaping** - the previous bash here-string had to escape single quotes in the HCL source, which is a known footgun on configurations containing arbitrary string literals. Stdin avoids the problem entirely.
 
 Errors surface with the file path, the `hcl2json` exit status, and the captured stderr, so a syntax error in a single `.tf` file produces a debuggable message rather than a raw `Error: Command failed`.
+
+---
+
+## CloudFormation support: the TF-JSON shape is the IR
+
+`infrarails` scans CloudFormation templates with the **same rule code** that scans Terraform. The trick is that the scanner's internal representation was never really "Terraform" - it is the uniform JSON shape `hcl2json` produces (`ParsedFile` / `HCL2JSONOutput`), and every rule, the resolver, and the plan overlay already speak it. CloudFormation support is therefore one normalisation layer ([src/cfn/](src/cfn/)), not a rule-layer fork:
+
+1. **[src/cfn/template.ts](src/cfn/template.ts)** parses a template (YAML with CFN short tags, or JSON) and canonicalises every intrinsic to its long form (`!Ref X` -> `{ Ref: 'X' }`). The YAML path registers no custom tags - unknown tags parse as warnings, the AST keeps `.tag`, and a single walk produces both the canonical values and per-resource line numbers.
+2. **[src/cfn/intrinsics.ts](src/cfn/intrinsics.ts)** translates intrinsics into the TF-shaped expressions the resolver already classifies: `!Ref Param` -> `${var.Param}` (Parameters become `variable` blocks), `!GetAtt Bucket.Arn` -> `${aws_s3_bucket.Bucket.arn}`, all-static `Join`/`Select`/`Split`/`FindInMap`/`Base64` -> literals. Anything CFN resolves only at deploy time becomes a sentinel `${cfn:<reason>:<detail>}` the resolver maps to a precise `UnresolvableReason` (`cfn-import-value`, `cfn-dynamic-reference`, `cfn-pseudo-parameter`, `cfn-fn-not-static`) -> INCONCLUSIVE, never a fabricated value.
+3. **[src/cfn/normalise.ts](src/cfn/normalise.ts)** maps resources into the Terraform vocabulary: `AWS::S3::Bucket` becomes `aws_s3_bucket` **plus** the companion resources Terraform splits out (`aws_s3_bucket_server_side_encryption_configuration`, `_versioning`, `_lifecycle_configuration`, `_object_lock_configuration`) synthesized from the inline CFN blocks; `AWS::Bedrock::*` bodies are key-snake_cased (the TF provider mirrors the same API surface CFN mirrors); IAM inline policies are serialised to the JSON-string `policy` attribute; nested stacks (`AWS::CloudFormation::Stack`) become module calls with `TemplateURL` as `source` and snake_cased `Parameters` as inputs, so the remote-module wall and Bedrock-input detection work unchanged.
+
+Two honesty mechanisms are CFN-specific:
+
+- **Conditions.** A resource guarded by `Condition:` is stamped (`__cfn_condition` on the body); rules emit INCONCLUSIVE (`cfn-condition-gated`) for it before any property check, because a conditionally created control may simply not exist at deploy time. v1 never evaluates condition trees.
+- **The Bedrock logging gap.** CloudFormation has **no resource type** for Bedrock model invocation logging (AWS's own guidance uses a Lambda-backed custom resource). When every Bedrock-usage signal comes from CFN sources and no logging config exists, `S-12.1.1` emits a CFN-specific INCONCLUSIVE - even under `--strict-account-logging`, because a FAIL would demand a fix CFN cannot express.
+
+Line attribution works through a synthetic `rawHcl`: the normaliser writes one `resource "<tf_type>" "<LogicalId>"` header per synthesized resource at the template line where the resource (or the relevant `Properties` block) was declared, so `findResourceLine()` points findings at real YAML/JSON lines. Auto-detection is by extension plus content shape (`looksLikeCfnTemplate`): a Kubernetes manifest or `package.json` walks past the extension filter and is skipped on shape; a malformed file that *sniffs* like CFN is a hard exit-2 error - a compliance scanner must not silently skip a template it was pointed at.
+
+The `--plan` overlay remains Terraform-only; CFN change sets are a separate feature.
 
 ---
 

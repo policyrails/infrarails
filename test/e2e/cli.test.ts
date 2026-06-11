@@ -662,6 +662,118 @@ describeIf('CLI e2e', () => {
     });
   });
 
+  describe('CloudFormation support', () => {
+    const cfnDir = path.resolve(__dirname, '../fixtures/cloudformation');
+    const mixedDir = path.resolve(__dirname, '../fixtures/mixed');
+
+    function findingsOf(args: string): Array<{
+      ruleId: string;
+      status: string;
+      description: string;
+      filePath: string;
+      line?: number;
+    }> {
+      const result = runCli(`${args} --format json`);
+      return JSON.parse(result.stdout).findings;
+    }
+
+    it('guardrails template: guardrail rules PASS, S-12.1.1 INCONCLUSIVE (CFN logging gap)', () => {
+      const findings = findingsOf(`${cfnDir}/guardrails`);
+      const byId = (id: string) => findings.find((f) => f.ruleId === id)!;
+
+      const logging = byId('S-12.1.1');
+      expect(logging.status).toBe('INCONCLUSIVE');
+      expect(logging.description).toMatch(/CloudFormation has no resource type/);
+
+      expect(byId('S-9.x.1').status).toBe('PASS');
+      expect(byId('S-9.x.2').status).toBe('PASS');
+      expect(byId('S-9.x.3').status).toBe('PASS');
+      expect(byId('S-12.x.4').status).toBe('PASS');
+
+      // Findings point at real template lines via the synthetic rawHcl.
+      expect(byId('S-9.x.3').filePath).toMatch(/template\.yaml$/);
+      expect(byId('S-9.x.3').line).toBe(10);
+      expect(byId('S-9.x.1').line).toBe(31);
+    });
+
+    it('CFN-only report speaks CFN vocabulary (types, logical ids, properties)', () => {
+      const result = runCli(`${cfnDir}/guardrails`);
+      // Resource citations use the CFN type + quoted logical id, not TF addresses.
+      expect(result.stdout).toContain('AWS::Bedrock::Guardrail "StrongGuardrail"');
+      expect(result.stdout).not.toMatch(/aws_bedrock_guardrail/);
+      expect(result.stdout).not.toMatch(/aws_bedrockagent_agent/);
+      // TF-only remediation advice (a resource type CFN does not have)
+      // legitimately keeps its Terraform name.
+      expect(result.stdout).toContain('aws_bedrock_model_invocation_logging_configuration');
+    });
+
+    it('mixed dir keeps TF findings in TF vocabulary while CFN findings speak CFN', () => {
+      const findings = findingsOf(`${mixedDir}/tf-logging-cfn-storage`);
+      // The pathless S-9.x.2/S-9.x.3-style findings and TF-pathed findings stay
+      // canonical; nothing in a TF-sourced finding gets CFN-ised.
+      for (const f of findings) {
+        if (f.filePath.endsWith('.tf')) {
+          expect(f.description).not.toContain('AWS::');
+        }
+      }
+    });
+
+    it('conditional template: Condition-gated trail -> INCONCLUSIVE naming the condition', () => {
+      const findings = findingsOf(`${cfnDir}/conditional`);
+      const trail = findings.find((f) => f.ruleId === 'S-12.x.4')!;
+      expect(trail.status).toBe('INCONCLUSIVE');
+      expect(trail.description).toMatch(/Condition "CreateTrail"/);
+    });
+
+    it('mixed dir: TF logging config + CFN storage -> phase-2 rules PASS against CFN resources', () => {
+      const findings = findingsOf(`${mixedDir}/tf-logging-cfn-storage`);
+      const byId = (id: string) => findings.find((f) => f.ruleId === id)!;
+      expect(byId('S-12.1.1').status).toBe('PASS');
+      expect(byId('S-12.1.2a').status).toBe('PASS');
+      expect(byId('S-12.1.2b').status).toBe('PASS');
+      expect(byId('S-12.x.1').status).toBe('PASS');
+      expect(byId('S-12.x.2a').status).toBe('PASS');
+      // CFN-sourced findings cite the template, TF-sourced cite the .tf file.
+      expect(byId('S-12.x.2a').filePath).toMatch(/storage\.yaml$/);
+      expect(byId('S-12.1.1').filePath).toMatch(/main\.tf$/);
+    });
+
+    it('mixed terminal report carries per-finding dialect chips', () => {
+      const result = runCli(`${mixedDir}/tf-logging-cfn-storage`);
+      expect(result.stdout).toMatch(/\[cloudformation\]/);
+      expect(result.stdout).toMatch(/\[terraform\]/);
+    });
+
+    it('single-dialect terminal report has no chips', () => {
+      const result = runCli(`${fixturesDir}/compliant`);
+      expect(result.stdout).not.toMatch(/\[terraform\]/);
+    });
+
+    it('--input tf skips CFN templates entirely', () => {
+      const result = runCli(`${cfnDir}/guardrails --input tf`);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/No Terraform or CloudFormation files found/);
+    });
+
+    it('--input cfn skips Terraform files in a mixed dir', () => {
+      const findings = findingsOf(`${mixedDir}/tf-logging-cfn-storage --input cfn`);
+      const logging = findings.find((f) => f.ruleId === 'S-12.1.1')!;
+      expect(logging.status).toBe('SKIP'); // TF logging config not scanned
+    });
+
+    it('--input bogus exits 2', () => {
+      const result = runCli(`${cfnDir}/guardrails --input bogus`);
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toMatch(/unknown input mode/i);
+    });
+
+    it('malformed CFN template exits 2 with a parse error', () => {
+      const result = runCli(`${cfnDir}/malformed`);
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toMatch(/could not be parsed/i);
+    });
+  });
+
   describe('INCONCLUSIVE behaviour', () => {
     const inconclusiveDir = path.resolve(__dirname, '../fixtures/inconclusive');
 

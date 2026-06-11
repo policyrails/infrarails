@@ -2,11 +2,12 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ensureHcl2Json } from './utils/hcl2json-check';
-import { parseAllTfFiles } from './parser';
+import { IacInputMode, parseAllIaCFiles } from './parser';
 import { runScan } from './runner';
 import { parsePlanFile } from './plan-parser';
 import { PlanOverlay } from './types';
 import { formatTerminal, formatJson, formatHtml, formatPdf, formatSarif } from './formatter';
+import { applyCfnPresentation } from './cfn/presentation';
 
 // Injected at build time by tsup from package.json (see tsup.config.ts).
 declare const __APP_VERSION__: string;
@@ -15,9 +16,9 @@ const program = new Command();
 
 program
   .name('infrarails')
-  .description('Scan Terraform HCL files for EU AI Act Article 12 compliance gaps')
+  .description('Scan Terraform and CloudFormation files for EU AI Act Article 12 compliance gaps')
   .version(__APP_VERSION__)
-  .argument('<directory>', 'Directory containing Terraform .tf files')
+  .argument('<directory>', 'Directory containing Terraform (.tf/.tf.json) and/or CloudFormation (.yaml/.yml/.json) files')
   .option(
     '-f, --format <format>',
     'Output format: terminal, json, sarif, html, pdf',
@@ -36,6 +37,11 @@ program
   .option(
     '--plan <file>',
     'Terraform plan JSON (`terraform show -json tfplan.bin`) — resolves variables and scans resources inside modules',
+  )
+  .option(
+    '--input <mode>',
+    'Input dialect: auto (detect per file), tf (Terraform only), cfn (CloudFormation only)',
+    'auto',
   )
   .addHelpText(
     'after',
@@ -63,10 +69,20 @@ Strict flags (independent axes)
       strict: boolean;
       strictAccountLogging: boolean;
       plan?: string;
+      input: string;
     },
   ) => {
-    // Check hcl2json is installed
-    ensureHcl2Json();
+    const VALID_INPUT_MODES: IacInputMode[] = ['auto', 'tf', 'cfn'];
+    if (!VALID_INPUT_MODES.includes(options.input as IacInputMode)) {
+      console.error(
+        `Error: unknown input mode "${options.input}". Valid modes: ${VALID_INPUT_MODES.join(', ')}.`,
+      );
+      process.exit(2);
+    }
+    const inputMode = options.input as IacInputMode;
+
+    // Check hcl2json is installed (needed for the Terraform path only).
+    if (inputMode !== 'cfn') ensureHcl2Json();
 
     // Validate format up-front - silent fall-through to terminal mode hides bugs
     // (e.g. an older globally-installed binary asked for "pdf" and writes ANSI
@@ -126,18 +142,32 @@ Strict flags (independent axes)
       );
     }
 
-    // Collect and parse all .tf and .tf.json files
-    const parsedFiles = parseAllTfFiles(dir);
+    // Collect and parse all IaC files (Terraform + CloudFormation).
+    // Malformed CFN templates are a hard error (exit 2): a compliance scanner
+    // must not silently skip a template it was pointed at.
+    let parsedFiles;
+    try {
+      parsedFiles = parseAllIaCFiles(dir, inputMode);
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
     if (parsedFiles.length === 0) {
-      console.log('No .tf files found in the specified directory.');
+      console.log('No Terraform or CloudFormation files found in the specified directory.');
       process.exit(0);
     }
 
-    // Run scan
-    const findings = runScan(parsedFiles, {
-      strictAccountLogging: options.strictAccountLogging,
-      plan: overlay,
-    });
+    // Run scan. Findings are composed in the canonical TF vocabulary; the
+    // presentation pass re-voices CFN-sourced findings in CFN vocabulary
+    // (AWS::Bedrock::Guardrail "GR", GuardrailVersion, ...) for every output
+    // format, leaving TF-sourced findings untouched.
+    const findings = applyCfnPresentation(
+      runScan(parsedFiles, {
+        strictAccountLogging: options.strictAccountLogging,
+        plan: overlay,
+      }),
+      parsedFiles.map((f) => f.filePath),
+    );
 
     // Format output - PDF is a Buffer, others are strings.
     let rendered: string | Buffer;

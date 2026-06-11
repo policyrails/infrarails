@@ -2,6 +2,8 @@ import * as path from 'path';
 import { Finding, ParsedFile, PlanOverlay, PlanResource, ScanRule, UnresolvedRef } from '../types';
 import { explainReason, resolveExpression } from '../resolver';
 
+export { cfnConditionOf, isCfnTemplatePath } from '../cfn/source';
+
 /**
  * Build an INCONCLUSIVE finding for a rule that depends on a Bedrock-logging
  * reference we could not resolve statically (var with no default, SSM, module
@@ -24,6 +26,36 @@ export function inconclusiveFromUnresolved(
     nistReference: rule.nistReference,
     isoReference: rule.isoReference,
     unresolvedReason: ref.reason,
+  };
+}
+
+/**
+ * Build an INCONCLUSIVE finding for a CloudFormation resource guarded by a
+ * Condition. Emitted by rules *before* any property check: a conditionally
+ * created control may simply not exist at deploy time, so neither PASS nor
+ * FAIL is honest. The cfn-condition-gated reason is never escalated by
+ * strict mode (the plan overlay is Terraform-only and cannot resolve it).
+ */
+export function inconclusiveConditional(
+  rule: ScanRule,
+  args: { label: string; condition: string; filePath: string; line?: number },
+): Finding {
+  return {
+    ruleId: rule.id,
+    status: 'INCONCLUSIVE',
+    filePath: args.filePath,
+    line: args.line,
+    description:
+      `${args.label} is created conditionally (CloudFormation Condition ` +
+      `"${args.condition}"); static scanning cannot determine whether it will exist at ` +
+      `deploy time, so ${rule.id} cannot be verified.`,
+    remediation:
+      'Evaluate the stack with the intended parameter values (e.g. via a change set), or ' +
+      'remove the Condition from the compliance-relevant resource so it is always created.',
+    regulatoryReference: rule.regulatoryReference,
+    nistReference: rule.nistReference,
+    isoReference: rule.isoReference,
+    unresolvedReason: 'cfn-condition-gated',
   };
 }
 
@@ -868,6 +900,39 @@ function matchModuleNameTokens(name: string): string[] {
     if (normalized.includes(token)) matched.push(token);
   }
   return matched;
+}
+
+/**
+ * Find Fn::ImportValue references (normalised to `${cfn:import-value:<name>}`
+ * sentinels) whose export name carries an account-baseline / central-logging
+ * token. The CFN equivalent of findBaselineRemoteState: importing
+ * "baseline-trail-arn" strongly implies account-level infrastructure lives
+ * in a separate (unscanned) stack.
+ */
+export function findCfnBaselineImports(
+  files: ParsedFile[],
+): Array<{ importName: string; matchedToken: string; filePath: string }> {
+  const results: Array<{ importName: string; matchedToken: string; filePath: string }> = [];
+  const seen = new Set<string>();
+
+  for (const file of files) {
+    const resourceTree = file.json.resource;
+    if (!resourceTree) continue;
+    visitStrings(resourceTree, (s) => {
+      const m = s.match(/^\$\{cfn:import-value:(.+)\}$/);
+      if (!m) return;
+      const importName = m[1];
+      const lower = importName.toLowerCase();
+      const matchedToken = BASELINE_REMOTE_STATE_NAMES.find((tok) => lower.includes(tok));
+      if (!matchedToken) return;
+      const key = `${importName}|${file.filePath}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      results.push({ importName, matchedToken, filePath: file.filePath });
+    });
+  }
+
+  return results;
 }
 
 /**

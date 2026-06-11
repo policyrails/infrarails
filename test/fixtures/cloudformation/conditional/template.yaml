@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Compliance-relevant resources gated behind Conditions.
+
+Parameters:
+  EnableTrail:
+    Type: String
+    Default: 'false'
+
+Conditions:
+  CreateTrail: !Equals [!Ref EnableTrail, 'true']
+
+Resources:
+  MaybeTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateTrail
+    Properties:
+      IsLogging: true
+      S3BucketName: conditional-audit-bucket

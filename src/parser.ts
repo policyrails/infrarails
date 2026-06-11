@@ -2,6 +2,8 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ParsedFile, HCL2JSONOutput } from './types';
+import { parseCfnTemplate, rawTextSniffsCfn } from './cfn/template';
+import { normaliseCfnTemplate } from './cfn/normalise';
 
 const SKIP_DIRS = new Set([
   'node_modules',         // JS/TS dependencies (CDK for Terraform)
@@ -21,6 +23,27 @@ const SKIP_DIRS = new Set([
  * JSON form, so a scanner that ignored .tf.json would be blind to those repos.
  */
 export function collectTfFiles(dir: string): string[] {
+  return collectFiles(dir, (name) => name.endsWith('.tf') || name.endsWith('.tf.json'));
+}
+
+/**
+ * Recursively collect CloudFormation template *candidates*: .yaml/.yml plus
+ * .json that is not Terraform JSON. Whether a candidate actually IS a CFN
+ * template is decided by content (looksLikeCfnTemplate) in parseAllIaCFiles -
+ * a Kubernetes manifest or a package.json walks past this filter and is then
+ * skipped on shape.
+ */
+export function collectCfnCandidates(dir: string): string[] {
+  return collectFiles(
+    dir,
+    (name) =>
+      name.endsWith('.yaml') ||
+      name.endsWith('.yml') ||
+      (name.endsWith('.json') && !name.endsWith('.tf.json')),
+  );
+}
+
+function collectFiles(dir: string, matches: (fileName: string) => boolean): string[] {
   const results: string[] = [];
 
   function walk(currentDir: string) {
@@ -30,7 +53,7 @@ export function collectTfFiles(dir: string): string[] {
       if (entry.isDirectory()) {
         if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
         walk(fullPath);
-      } else if (entry.isFile() && (entry.name.endsWith('.tf') || entry.name.endsWith('.tf.json'))) {
+      } else if (entry.isFile() && matches(entry.name)) {
         results.push(fullPath);
       }
     }
@@ -84,4 +107,51 @@ export function parseTfFile(filePath: string): ParsedFile {
 export function parseAllTfFiles(dir: string): ParsedFile[] {
   const tfFiles = collectTfFiles(dir);
   return tfFiles.map((f) => parseTfFile(f));
+}
+
+export type IacInputMode = 'auto' | 'tf' | 'cfn';
+
+/**
+ * Parse every supported IaC file in a directory into the shared ParsedFile
+ * shape: Terraform natively, CloudFormation via the CFN normaliser. Mixed
+ * directories Just Work - each file is routed by extension + content shape,
+ * so a repo holding a Terraform module next to a SAM template scans both.
+ *
+ * `mode` forces one dialect for CI pipelines that want a hard guarantee:
+ * 'tf' silently skips CFN templates, 'cfn' skips Terraform.
+ *
+ * Error policy for CFN candidates that fail to parse: fatal only when the
+ * raw text plausibly IS a CFN template (rawTextSniffsCfn) - a malformed
+ * template must not be silently ignored by a compliance scanner. Unrelated
+ * YAML that the parser chokes on (a helm chart with {{ }} templating) is
+ * skipped.
+ */
+export function parseAllIaCFiles(dir: string, mode: IacInputMode = 'auto'): ParsedFile[] {
+  const results: ParsedFile[] = [];
+
+  if (mode !== 'cfn') {
+    results.push(...parseAllTfFiles(dir));
+  }
+
+  if (mode !== 'tf') {
+    for (const filePath of collectCfnCandidates(dir)) {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      let template;
+      try {
+        template = parseCfnTemplate(filePath, raw);
+      } catch (err) {
+        if (rawTextSniffsCfn(raw)) {
+          throw new Error(
+            `CloudFormation template ${filePath} could not be parsed: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        continue; // unparseable non-CFN YAML/JSON (helm chart, etc.)
+      }
+      if (!template) continue; // parsed fine but not a CFN template
+      results.push(normaliseCfnTemplate(template));
+    }
+  }
+
+  return results;
 }

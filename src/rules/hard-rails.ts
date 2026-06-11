@@ -1,5 +1,5 @@
 import { ScanRule, Finding, ParsedFile, ScanContext, UnresolvableReason, PlanOverlay } from '../types';
-import { findResources, findResourceLine, getNestedValue, FoundResource } from '../utils/resource-helpers';
+import { findResources, findResourceLine, getNestedValue, FoundResource, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 import { resolveExpression } from '../resolver';
 import { buildGuardrailGraph } from '../utils/guardrail-graph';
@@ -59,7 +59,7 @@ const VENDOR_SCOPE_NOTE =
   'non-AWS guardrail vendors or SDK-layer (InvokeModel/Converse) enforcement.';
 
 const UNATTACHED_NOTE =
-  ' Not attached to any Bedrock Agent in scanned Terraform; if used via SDK ' +
+  ' Not attached to any Bedrock Agent in the scanned IaC; if used via SDK ' +
   'InvokeModel/Converse this is expected and not verifiable here.';
 
 // PROMPT_ATTACK accepts LOW as blocking (any non-NONE strength is a real
@@ -119,7 +119,7 @@ export const hardRailsRule: ScanRule = {
           status: 'SKIP',
           filePath: '',
           description:
-            'No aws_bedrock_guardrail declared in scanned Terraform. Body inspection ' +
+            'No aws_bedrock_guardrail declared in scanned IaC. Body inspection ' +
             'skipped - see S-9.x.2 for the presence-layer signal.',
           remediation: '',
           regulatoryReference: REGULATORY_REFERENCE,
@@ -151,6 +151,18 @@ function evaluateGuardrail(
   const sourceFilePath = gr.source === 'hcl' ? gr.filePath : undefined;
   const body = gr.body;
   const label = guardrailLabel(gr.name, attachingAgents);
+
+  // Condition-guarded CFN guardrail: its body cannot be trusted to exist at
+  // deploy time, so body inspection cannot produce a PASS/WARN verdict.
+  const condition = cfnConditionOf(body);
+  if (condition) {
+    return inconclusiveConditional(rule, {
+      label,
+      condition,
+      filePath: gr.filePath,
+      line,
+    });
+  }
 
   const base = {
     ruleId: rule.id,

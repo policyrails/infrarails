@@ -1,3 +1,5 @@
+<img src="assets/infrarails-logo.svg" alt="Infrarails" width="240" />
+
 # infrarails
 
 > Static **EU AI Act / NIST AI RMF / ISO 42001** compliance scanner for **AWS Bedrock** Terraform. Reads your `.tf` files - no deploy, no AWS credentials - and reports which Article 9 (guardrails) and Article 12 (logging, retention, traceability) controls pass, fail, or can't be verified.

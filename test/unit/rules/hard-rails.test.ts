@@ -3,7 +3,7 @@ import { hardRailsRule } from '../../../src/rules/hard-rails';
 import { runScan } from '../../../src/runner';
 import { emptyContext, emptyPlanOverlay } from './helpers';
 import { parsePlanObject } from '../../../src/plan-parser';
-import { ParsedFile, HCL2JSONOutput } from '../../../src/types';
+import { ParsedFile, HCL2JSONOutput, Finding } from '../../../src/types';
 
 // --- builders for the hcl2json guardrail body shape ------------------------
 
@@ -55,6 +55,18 @@ function run(files: ParsedFile[], ctx = emptyContext()) {
   return hardRailsRule.run(files, ctx);
 }
 
+// Flatten the headline description plus the structured context rows and scope
+// note into one searchable string. The supporting observations that used to
+// live inside `description` now live in `context[]` / `scopeNote`; assertions
+// on that relocated text search the flattened form.
+function allText(f: Finding): string {
+  return [
+    f.description,
+    ...(f.context ?? []).map((d) => `${d.label}: ${d.text}`),
+    f.scopeNote ?? '',
+  ].join('\n');
+}
+
 describe('S-9.x.3 hard-rails enforcement', () => {
   it('SKIPs when no aws_bedrock_guardrail is declared', () => {
     const file: ParsedFile = {
@@ -79,15 +91,15 @@ describe('S-9.x.3 hard-rails enforcement', () => {
     const findings = run([grFile(bothMandatoryBlocking())]);
     expect(findings[0].status).toBe('PASS');
     expect(findings[0].description).toContain('enforces both mandatory surfaces');
-    expect(findings[0].description).toContain('adversarial-input resilience');
+    expect(allText(findings[0])).toContain('adversarial-input resilience');
   });
 
   it('WARNs (mandatory gap) when PROMPT_ATTACK is present but no harmful-content filter', () => {
     const findings = run([grFile(merge(contentPolicy(paFilter('HIGH'))))]);
     expect(findings[0].status).toBe('WARN');
     expect(findings[0].description).toContain('no harmful-content filter declared');
-    expect(findings[0].description).toContain(
-      'The other mandatory surface is enforcing: the PROMPT_ATTACK prompt-injection filter',
+    expect(allText(findings[0])).toContain(
+      'Still enforcing: the PROMPT_ATTACK prompt-injection filter',
     );
   });
 
@@ -95,8 +107,8 @@ describe('S-9.x.3 hard-rails enforcement', () => {
     const findings = run([grFile(merge(contentPolicy(harmfulFilter('HATE', 'HIGH', 'HIGH'))))]);
     expect(findings[0].status).toBe('WARN');
     expect(findings[0].description).toContain('prompt injection uncontrolled');
-    expect(findings[0].description).toContain(
-      'The other mandatory surface is enforcing: a harmful-content filter (MEDIUM+)',
+    expect(allText(findings[0])).toContain(
+      'Still enforcing: a harmful-content filter (MEDIUM+)',
     );
   });
 
@@ -122,8 +134,8 @@ describe('S-9.x.3 hard-rails enforcement', () => {
       grFile(bothMandatoryBlocking(piiPolicy({ type: 'NAME', action: 'ANONYMIZE' }))),
     ]);
     expect(findings[0].status).toBe('PASS');
-    expect(findings[0].description).toContain('Also enforcing: PII');
-    expect(findings[0].description).toContain('consider BLOCK');
+    expect(allText(findings[0])).toContain('Also enforcing: PII');
+    expect(allText(findings[0])).toContain('consider BLOCK');
   });
 
   it('PASSes with mixed PII BLOCK + ANONYMIZE (no advisory note when a BLOCK exists)', () => {
@@ -135,14 +147,14 @@ describe('S-9.x.3 hard-rails enforcement', () => {
       ),
     ]);
     expect(findings[0].status).toBe('PASS');
-    expect(findings[0].description).toContain('Also enforcing: PII');
-    expect(findings[0].description).not.toContain('consider BLOCK');
+    expect(allText(findings[0])).toContain('Also enforcing: PII');
+    expect(allText(findings[0])).not.toContain('consider BLOCK');
   });
 
   it('PASSes with no PII config and notes the surface is not configured (no WARN)', () => {
     const findings = run([grFile(bothMandatoryBlocking())]);
     expect(findings[0].status).toBe('PASS');
-    expect(findings[0].description).toContain('PII surface not configured');
+    expect(allText(findings[0])).toContain('PII surface not configured');
   });
 
   it('PASSes with grounding threshold = 0 (permissive grounding does not gate)', () => {
@@ -151,7 +163,7 @@ describe('S-9.x.3 hard-rails enforcement', () => {
     ]);
     expect(findings[0].status).toBe('PASS');
     // Grounding is declared-but-permissive: not reported as "enforcing" nor as "not configured".
-    expect(findings[0].description).not.toContain('Also enforcing: contextual grounding');
+    expect(allText(findings[0])).not.toContain('Also enforcing: contextual grounding');
   });
 
   it('PASSes with grounding threshold = 0.7 and reports grounding as enforcing', () => {
@@ -159,13 +171,13 @@ describe('S-9.x.3 hard-rails enforcement', () => {
       grFile(bothMandatoryBlocking(groundingPolicy({ type: 'GROUNDING', threshold: 0.7 }))),
     ]);
     expect(findings[0].status).toBe('PASS');
-    expect(findings[0].description).toContain('contextual grounding');
+    expect(allText(findings[0])).toContain('Also enforcing: contextual grounding');
   });
 
   it('PASSes and reports denied topics as an informational note', () => {
     const findings = run([grFile(bothMandatoryBlocking(denyTopic()))]);
     expect(findings[0].status).toBe('PASS');
-    expect(findings[0].description).toContain('1 denied topic(s) declared');
+    expect(allText(findings[0])).toContain('Denied topics: 1 declared (informational)');
   });
 
   it('is INCONCLUSIVE when PROMPT_ATTACK input_strength is a var with no default', () => {
@@ -282,7 +294,7 @@ describe('S-9.x.3 hard-rails enforcement', () => {
 
     it('appends the SDK-blind-spot note when no agent attaches the guardrail', () => {
       const findings = run([grFile(merge(contentPolicy(harmfulFilter('HATE', 'HIGH', 'HIGH'))))]);
-      expect(findings[0].description).toContain('Not attached to any Bedrock Agent');
+      expect(allText(findings[0])).toContain('Not attached to any Bedrock Agent');
     });
   });
 
@@ -365,6 +377,6 @@ describe('S-9.x.3 attaching-agent enrichment via plan configuration', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0].status).toBe('PASS');
     expect(findings[0].description).toContain('attached to agent(s): recruiter');
-    expect(findings[0].description).not.toContain('Not attached to any Bedrock Agent');
+    expect(allText(findings[0])).not.toContain('Not attached to any Bedrock Agent');
   });
 });

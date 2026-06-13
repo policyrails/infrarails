@@ -599,11 +599,24 @@ describeIf('CLI e2e', () => {
   describe('S-9.x.3 hard-rails body inspection', () => {
     const grDir = path.resolve(__dirname, '../fixtures/guardrail-bodies');
 
-    function hardRails(fixture: string, args = ''): Array<{ status: string; description: string }> {
+    type HardRailsFinding = {
+      status: string;
+      description: string;
+      context?: { label: string; text: string }[];
+      scopeNote?: string;
+    };
+
+    function hardRails(fixture: string, args = ''): HardRailsFinding[] {
       const result = runCli(`${grDir}/${fixture} ${args} --format json`.trim());
       const parsed = JSON.parse(result.stdout);
       return parsed.findings.filter((f: { ruleId: string }) => f.ruleId === 'S-9.x.3');
     }
+
+    // The supporting observations that used to be glued into `description` now
+    // live in the structured `context[]` / `scopeNote` fields; flatten them for
+    // substring assertions.
+    const flat = (f: HardRailsFinding): string =>
+      [f.description, ...(f.context ?? []).map((d) => `${d.label}: ${d.text}`), f.scopeNote ?? ''].join('\n');
 
     it('empty-body → WARN (empty)', () => {
       const [f] = hardRails('empty-body');
@@ -636,13 +649,13 @@ describeIf('CLI e2e', () => {
     it('pii-anonymize → PASS (ANONYMIZE counts as enforcing)', () => {
       const [f] = hardRails('pii-anonymize');
       expect(f.status).toBe('PASS');
-      expect(f.description).toMatch(/Also enforcing: PII/);
+      expect(flat(f)).toMatch(/Also enforcing: PII/);
     });
 
     it('grounding-threshold-set → PASS with grounding enforcing', () => {
       const [f] = hardRails('grounding-threshold-set');
       expect(f.status).toBe('PASS');
-      expect(f.description).toMatch(/contextual grounding/);
+      expect(flat(f)).toMatch(/contextual grounding/);
     });
 
     it('dynamic-filters → INCONCLUSIVE', () => {
@@ -657,7 +670,7 @@ describeIf('CLI e2e', () => {
       const weak = findings.find((f) => f.description.includes('aws_bedrock_guardrail.weak'))!;
       expect(strong.status).toBe('PASS');
       expect(strong.description).toMatch(/attached to agent\(s\): support_bot/);
-      expect(strong.description).toMatch(/denied topic/);
+      expect(flat(strong)).toMatch(/Denied topics/);
       expect(weak.status).toBe('WARN');
     });
   });

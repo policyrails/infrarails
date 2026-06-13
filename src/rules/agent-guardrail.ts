@@ -26,8 +26,10 @@ const RATIONALE =
 // the org layer (sibling rule S-9.x.2 detects "Bedrock is used but no
 // aws_bedrock_guardrail is declared anywhere in scanned files" as a weaker
 // presence signal).
+// The "Scope" label is supplied by the formatters and the SARIF message
+// builder (scopeNote field), so this string must not repeat it.
 const SCOPE_NOTE =
-  'Scope: this rule only verifies Agent-attached guardrails. For raw ' +
+  'This rule only verifies Agent-attached guardrails. For raw ' +
   'InvokeModel / Converse SDK calls, the guardrailIdentifier parameter is ' +
   'passed in application code and is not verifiable from IaC - verify ' +
   'SDK call sites separately. See also rule S-9.x.2 for guardrail-presence ' +
@@ -107,7 +109,8 @@ export const agentGuardrailRule: ScanRule = {
             'Add a guardrail_configuration block to aws_bedrockagent_agent referencing an ' +
             'aws_bedrock_guardrail (with guardrail_identifier set to the guardrail ID and ' +
             'guardrail_version pinned to a numbered version, not "DRAFT"). ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -137,7 +140,8 @@ export const agentGuardrailRule: ScanRule = {
           description: `Bedrock Agent "${agent.name}" declares guardrail_configuration but guardrail_identifier is empty or unset - no guardrail is actually attached.`,
           remediation:
             'Set guardrail_identifier to the ID (or ARN) of an aws_bedrock_guardrail resource. ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -161,7 +165,8 @@ export const agentGuardrailRule: ScanRule = {
           remediation:
             'Scan the stack that declares aws_bedrock_guardrail.' +
             `${link.guardrail}, or document the cross-stack arrangement. ` +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -203,7 +208,8 @@ export const agentGuardrailRule: ScanRule = {
           remediation:
             'Inline a literal guardrail_identifier and a numbered guardrail_version, or rerun ' +
             'the scan with resolved values (e.g. via terraform plan output) so attachment can ' +
-            `be verified. Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `be verified. Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -221,7 +227,8 @@ export const agentGuardrailRule: ScanRule = {
             'Pin guardrail_version to a numbered version (e.g. "1", "2") published from an ' +
             'aws_bedrock_guardrail_version resource. DRAFT versions can be edited in place, so ' +
             'a passing audit today can be a failing one tomorrow with no Terraform diff. ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,

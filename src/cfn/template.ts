@@ -39,8 +39,14 @@ export interface CfnTemplate {
 /**
  * Shape check on an already-parsed template body. A JSON/YAML document is a
  * CFN template when it declares AWSTemplateFormatVersion, or a Transform
- * (SAM), or a Resources map whose every entry has an AWS::/Custom:: Type.
- * A package.json or a Kubernetes manifest fails all three.
+ * (SAM / macros / AWS::LanguageExtensions), or a Resources map whose every
+ * entry has a CFN resource Type. A package.json or a Kubernetes manifest
+ * fails all three.
+ *
+ * "CFN resource Type" is the Namespace::...::Resource shape: AWS::/Custom::/
+ * Alexa:: first-party types AND third-party registry / module types
+ * (MyOrg::Svc::Thing, MyOrg::Svc::Thing::MODULE), since a template without an
+ * AWSTemplateFormatVersion may legitimately consist only of those.
  */
 export function looksLikeCfnTemplate(parsed: unknown): boolean {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
@@ -58,11 +64,15 @@ export function looksLikeCfnTemplate(parsed: unknown): boolean {
         r !== null &&
         typeof r === 'object' &&
         typeof (r as Record<string, unknown>).Type === 'string' &&
-        /^(AWS|Custom|Alexa)::/.test((r as Record<string, unknown>).Type as string),
+        // Namespace::...::Resource: first-party (AWS/Custom/Alexa) plus
+        // third-party registry and module (::MODULE) types.
+        /^[A-Za-z0-9]+(::[A-Za-z0-9]+)+$/.test((r as Record<string, unknown>).Type as string),
     );
   if (resourcesAreCfn) return true;
 
-  // SAM templates may use Serverless::* types but always carry a Transform.
+  // Macro-driven templates (SAM's Serverless::*, AWS::LanguageExtensions
+  // Fn::ForEach loops whose Resources entries aren't plain {Type} objects)
+  // may not satisfy the per-entry check above, but always carry a Transform.
   if (
     (typeof obj.Transform === 'string' || Array.isArray(obj.Transform)) &&
     resources !== null &&

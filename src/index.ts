@@ -43,6 +43,10 @@ program
     'Input dialect: auto (detect per file), tf (Terraform only), cfn (CloudFormation only)',
     'auto',
   )
+  .option(
+    '--sarif-category <id>',
+    'SARIF automationDetails.id / GitHub Code Scanning category (disambiguates multiple uploads on one commit)',
+  )
   .addHelpText(
     'after',
     `
@@ -70,6 +74,7 @@ Strict flags (independent axes)
       strictAccountLogging: boolean;
       plan?: string;
       input: string;
+      sarifCategory?: string;
     },
   ) => {
     const VALID_INPUT_MODES: IacInputMode[] = ['auto', 'tf', 'cfn'];
@@ -174,7 +179,7 @@ Strict flags (independent axes)
     if (options.format === 'json') {
       rendered = formatJson(findings);
     } else if (options.format === 'sarif') {
-      rendered = formatSarif(findings);
+      rendered = formatSarif(findings, { category: options.sarifCategory });
     } else if (options.format === 'html') {
       rendered = formatHtml(findings);
     } else if (options.format === 'pdf') {

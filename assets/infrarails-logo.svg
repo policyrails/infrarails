@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="72" viewBox="0 0 300 72" role="img" aria-label="Infrarails">
+  <rect width="300" height="72" rx="12" fill="#0c2d52"/>
+  <g transform="translate(22,20)">
+    <path d="M4 12h24M4 19h24" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" opacity="0.45" fill="none"/>
+    <path d="M9 16.5l5 5 9.5-11" stroke="#c9a14a" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+  <text x="68" y="47" font-family="Georgia, 'Times New Roman', serif" font-size="30" font-weight="bold" letter-spacing="0.3">
+    <tspan fill="#ffffff">Infra</tspan><tspan fill="#c9a14a">rails</tspan>
+  </text>
+</svg>

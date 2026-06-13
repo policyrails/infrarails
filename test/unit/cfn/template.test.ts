@@ -40,6 +40,46 @@ describe('looksLikeCfnTemplate', () => {
   it('rejects a Resources map with non-CFN entries', () => {
     expect(looksLikeCfnTemplate({ Resources: { a: { foo: 1 } } })).toBe(false);
   });
+
+  it('accepts an Alexa:: type', () => {
+    expect(
+      looksLikeCfnTemplate({ Resources: { S: { Type: 'Alexa::ASK::Skill' } } }),
+    ).toBe(true);
+  });
+
+  it('accepts a third-party registry type with no AWSTemplateFormatVersion', () => {
+    expect(
+      looksLikeCfnTemplate({ Resources: { R: { Type: 'MyOrg::Service::Resource' } } }),
+    ).toBe(true);
+  });
+
+  it('accepts a module (::MODULE) type', () => {
+    expect(
+      looksLikeCfnTemplate({ Resources: { M: { Type: 'MyOrg::Service::Thing::MODULE' } } }),
+    ).toBe(true);
+  });
+
+  it('accepts AWS and registry types mixed in one Resources map', () => {
+    expect(
+      looksLikeCfnTemplate({
+        Resources: {
+          B: { Type: 'AWS::S3::Bucket' },
+          R: { Type: 'Datadog::Monitors::Monitor' },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects when any entry has a Type that is not Namespace::Resource shaped', () => {
+    expect(
+      looksLikeCfnTemplate({
+        Resources: {
+          B: { Type: 'AWS::S3::Bucket' },
+          K: { Type: 'ConfigMap' },
+        },
+      }),
+    ).toBe(false);
+  });
 });
 
 describe('rawTextSniffsCfn', () => {

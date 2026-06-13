@@ -1,5 +1,14 @@
 export type FindingStatus = 'PASS' | 'FAIL' | 'WARN' | 'SKIP' | 'INCONCLUSIVE';
 
+// One labeled supporting observation attached to a Finding. Lets a rule keep
+// the headline `description` to a single verdict and hand the secondary
+// context (what is still enforcing, what is not configured, etc.) to the
+// formatters as discrete rows instead of one run-on paragraph.
+export interface FindingDetail {
+  label: string;
+  text: string;
+}
+
 export interface Finding {
   ruleId: string;
   status: FindingStatus;
@@ -7,6 +16,13 @@ export interface Finding {
   line?: number;
   description: string;
   remediation: string;
+  // Optional structured detail rendered beneath the headline `description`.
+  // `context` holds labeled supporting observations; `scopeNote` carries the
+  // "what this rule does / does not see" caveat. Both optional, so rules that
+  // need only a one-line description (and the JSON/SARIF emitters) are
+  // unaffected.
+  context?: FindingDetail[];
+  scopeNote?: string;
   regulatoryReference: string;
   nistReference?: string;
   isoReference?: string;

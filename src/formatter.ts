@@ -3,6 +3,10 @@ import { Finding, FindingStatus } from './types';
 import { allRules } from './rules';
 import { sourceOfPath } from './cfn/source';
 
+// Injected at build time by tsup, and by vitest's define (see tsup.config.ts /
+// vitest.config.ts), from package.json — single source of truth for the version.
+declare const __APP_VERSION__: string;
+
 interface ScanSummary {
   total: number;
   pass: number;
@@ -174,7 +178,16 @@ export function formatTerminal(findings: Finding[]): string {
         : '';
       lines.push(`${icon} ${chalk.bold(f.ruleId)}  ${sourceChip}${f.description}`);
       if (location) lines.push(`   ${chalk.dim(location)}`);
+
+      if (f.context && f.context.length > 0) {
+        const w = Math.max(...f.context.map((d) => d.label.length));
+        for (const d of f.context) {
+          lines.push(`   ${chalk.dim(`${d.label.padEnd(w)} ·`)} ${d.text}`);
+        }
+      }
+
       if (f.remediation) lines.push(`   ${chalk.cyan('→')} ${f.remediation}`);
+      if (f.scopeNote) lines.push(`   ${chalk.dim(`Scope: ${f.scopeNote}`)}`);
 
       const refs = findingRefs(f);
       if (refs.length > 0) lines.push(`   ${chalk.dim(compactRefLine(refs))}`);
@@ -239,16 +252,17 @@ const SARIF_SCHEMA =
   'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json';
 const SARIF_VERSION = '2.1.0';
 const TOOL_NAME = 'infrarails';
-const TOOL_VERSION = '0.2.1';
-const TOOL_INFO_URI = 'https://github.com/vbalaji/infrarails';
+const TOOL_INFO_URI = 'https://github.com/policyrails/infrarails';
 
 type SarifLevel = 'none' | 'note' | 'warning' | 'error';
 type SarifKind = 'pass' | 'fail' | 'review' | 'notApplicable' | 'informational';
 
 // Status maps to two orthogonal SARIF fields:
-//   - kind  = the audit verdict (pass / fail / review / notApplicable)
+//   - kind  = the audit verdict (pass / fail / notApplicable)
 //   - level = the severity GitHub Code Scanning uses to colour the alert
-// INCONCLUSIVE → kind=review (SARIF's "needs human verification" bucket)
+// INCONCLUSIVE → level=warning + kind=fail (SARIF 3.27.9 requires level='none'
+// for any non-'fail' kind; we keep it visible as a warning, with the true
+// verdict preserved in properties.status).
 // SKIP → kind=notApplicable so it does not show up as an alert.
 function sarifLevel(status: FindingStatus): SarifLevel {
   switch (status) {
@@ -265,7 +279,10 @@ function sarifKind(status: FindingStatus): SarifKind {
     case 'PASS': return 'pass';
     case 'FAIL': return 'fail';
     case 'WARN': return 'fail';
-    case 'INCONCLUSIVE': return 'review';
+    // SARIF 3.27.9: when kind !== 'fail', level must be 'none'. sarifLevel keeps
+    // INCONCLUSIVE visible as 'warning', so kind must be 'fail' here to stay
+    // spec-legal; the true verdict is preserved in properties.status.
+    case 'INCONCLUSIVE': return 'fail';
     case 'SKIP': return 'notApplicable';
   }
 }
@@ -318,6 +335,11 @@ function sarifLocations(f: Finding): SarifLocation[] {
     physicalLocation: { artifactLocation: { uri: f.filePath } },
   };
   if (f.line && f.line > 0) {
+    // The SARIF `region` carries only `startLine` because the `Finding` type
+    // carries only `line` — there is no column/endLine data to emit. A precise
+    // highlight (`startColumn`/`endLine`/`endColumn`) would require extending
+    // `Finding` and threading column data out of every rule in src/rules/, a
+    // separate cross-cutting effort that is intentionally out of scope here.
     loc.physicalLocation.region = { startLine: f.line };
   }
   return [loc];
@@ -327,40 +349,70 @@ function sarifLocations(f: Finding): SarifLocation[] {
 // on the finding row, so we fold the description + remediation into a single
 // readable string instead of relying on properties bag.
 function sarifMessage(f: Finding): string {
-  if (f.remediation) return `${f.description}\n\nRemediation: ${f.remediation}`;
-  return f.description;
+  let msg = f.description;
+  if (f.context && f.context.length > 0) {
+    msg += '\n\n' + f.context.map((d) => `${d.label}: ${d.text}`).join('\n');
+  }
+  if (f.remediation) msg += `\n\nRemediation: ${f.remediation}`;
+  if (f.scopeNote) msg += `\n\nScope: ${f.scopeNote}`;
+  return msg;
 }
 
 // Stable per-finding fingerprint so GitHub Code Scanning can correlate the
-// same alert across re-runs even when line numbers shift slightly.
+// same alert across re-runs. The fingerprint is intentionally line-independent:
+// embedding the line number would change the fingerprint whenever code shifts
+// the line, defeating cross-run dedupe. We key on filePath only (which is
+// `plan:<address>` for plan-only findings, so those still get a stable identity).
 function partialFingerprints(f: Finding): Record<string, string> {
   return {
     'ruleId/v1': f.ruleId,
-    'location/v1': `${f.filePath ?? ''}:${f.line ?? ''}`,
+    'location/v1': f.filePath ?? '',
   };
 }
 
-export function formatSarif(findings: Finding[]): string {
+export function formatSarif(findings: Finding[], opts: { category?: string } = {}): string {
   // Build the rules section from the canonical rule registry so every rule
   // is described, not just ones with findings in this run. Ordered scanners
   // (CodeQL, ESLint, Semgrep) all do this — it gives consumers a stable
   // catalogue of what the tool can find.
-  const rules = allRules.map((r) => ({
-    id: r.id,
-    name: r.id,
-    shortDescription: { text: r.description },
-    fullDescription: { text: r.description },
-    helpUri: TOOL_INFO_URI,
-    defaultConfiguration: {
-      level: r.severity === 'FAIL' ? 'error' : 'warning',
-    },
-    properties: {
-      regulatoryReference: r.regulatoryReference,
-      ...(r.nistReference ? { nistReference: r.nistReference } : {}),
-      ...(r.isoReference ? { isoReference: r.isoReference } : {}),
-      tags: ['compliance', 'eu-ai-act', 'nist-ai-rmf', 'iso-42001'],
-    },
-  }));
+  const rules = allRules.map((r) => {
+    // Honest, per-rule tags: only advertise a framework when this rule actually
+    // maps to it, so tag-based filtering in consumers stays accurate. regulatory
+    // (EU AI Act) is always present; NIST/ISO are optional. The 'security' tag is
+    // what activates the per-rule security-severity in GitHub's Security tab, so
+    // every rule carries it.
+    const tags = ['compliance', 'security', 'eu-ai-act'];
+    if (r.nistReference) tags.push('nist-ai-rmf');
+    if (r.isoReference) tags.push('iso-42001');
+
+    // fullDescription is a strict superset of shortDescription: the same prose,
+    // then the framework citations appended so SARIF viewers that surface the
+    // long form show what the rule maps to without opening the properties bag.
+    let fullText = r.description + `\n\nMapped to: ${r.regulatoryReference}`;
+    if (r.nistReference) fullText += `; ${r.nistReference}`;
+    if (r.isoReference) fullText += `; ${r.isoReference}`;
+
+    return {
+      id: r.id,
+      name: r.id,
+      shortDescription: { text: r.description },
+      fullDescription: { text: fullText },
+      helpUri: TOOL_INFO_URI,
+      defaultConfiguration: {
+        level: r.severity === 'FAIL' ? 'error' : 'warning',
+      },
+      properties: {
+        regulatoryReference: r.regulatoryReference,
+        ...(r.nistReference ? { nistReference: r.nistReference } : {}),
+        ...(r.isoReference ? { isoReference: r.isoReference } : {}),
+        // GitHub Code Scanning only ranks/sorts alerts in the Security tab when
+        // each rule carries a numeric security-severity. FAIL = high (7.0),
+        // WARN = medium (4.0). Without it, all alerts land at a flat default.
+        'security-severity': r.severity === 'FAIL' ? '7.0' : '4.0',
+        tags,
+      },
+    };
+  });
 
   const ruleIndexById = new Map(allRules.map((r, i) => [r.id, i]));
 
@@ -408,11 +460,16 @@ export function formatSarif(findings: Finding[]): string {
         tool: {
           driver: {
             name: TOOL_NAME,
-            version: TOOL_VERSION,
+            version: __APP_VERSION__,
+            semanticVersion: __APP_VERSION__,
             informationUri: TOOL_INFO_URI,
             rules,
           },
         },
+        // GitHub Code Scanning "category" — disambiguates multiple upload-sarif
+        // uploads on the same commit (e.g. Terraform vs CloudFormation, or a
+        // build matrix). Without it, concurrent uploads silently overwrite.
+        automationDetails: { id: opts.category ?? TOOL_NAME },
         // GitHub Code Scanning anchors uriBaseId-bearing relative URIs against
         // the checkout root via the %SRCROOT% sentinel; the literal `file:///`
         // value is symbolic and ignored by GitHub but required by the SARIF
@@ -474,6 +531,15 @@ function renderFindingCard(f: Finding): string {
     ? `<p class="remediation"><span class="arrow">&rarr;</span> ${escapeHtml(f.remediation)}</p>`
     : '';
 
+  const contextRows = f.context && f.context.length > 0
+    ? `<dl class="detail">${f.context
+        .map((d) => `<dt>${escapeHtml(d.label)}</dt><dd>${escapeHtml(d.text)}</dd>`)
+        .join('')}</dl>`
+    : '';
+  const scopeNote = f.scopeNote
+    ? `<p class="scope-note"><span class="scope-label">Scope</span> ${escapeHtml(f.scopeNote)}</p>`
+    : '';
+
   const refs = findingRefs(f);
   const refPills = refs
     .map((r) => {
@@ -495,7 +561,9 @@ function renderFindingCard(f: Finding): string {
           ${location}
         </div>
         <p class="description">${escapeHtml(f.description)}</p>
+        ${contextRows}
         ${remediation}
+        ${scopeNote}
         <div class="refs">${refPills}</div>
       </article>`;
 }
@@ -678,6 +746,18 @@ ${cards}
   }
   .remediation .arrow { color: var(--pass); font-weight: 700; margin-right: .4rem; }
 
+  /* labeled supporting observations (context[]) */
+  .detail { display: grid; grid-template-columns: max-content 1fr;
+    gap: .25rem .8rem; margin: .55rem 0 .2rem; }
+  .detail dt { color: var(--muted); font-weight: 700; font-size: .66rem;
+    text-transform: uppercase; letter-spacing: .05em; padding-top: .15rem;
+    white-space: nowrap; }
+  .detail dd { margin: 0; color: var(--ink); font-size: .9rem; }
+  .scope-note { font-size: .8rem; color: var(--muted); margin: .55rem 0 .2rem;
+    line-height: 1.5; }
+  .scope-note .scope-label { font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; font-size: .66rem; margin-right: .45rem; color: var(--navy); }
+
   .refs { display: flex; flex-wrap: wrap; gap: .55rem .9rem;
     margin-top: .7rem; align-items: center; }
   .ref-group { display: inline-flex; align-items: center; gap: .35rem; flex-wrap: wrap; }
@@ -799,6 +879,8 @@ const PDF_MUTED = '#5a6b7d';
 const PDF_BORDER = '#d8e1ec';
 const PDF_TINT = '#f3f6fa';
 const PDF_REMEDIATION_BG = '#f0f8f2';
+const PDF_INCONCLUSIVE_BG = '#f0eff8';
+const PDF_INCONCLUSIVE_FG = '#38336b';
 
 type PDFDoc = PDFKit.PDFDocument;
 
@@ -1005,6 +1087,26 @@ function drawFinding(doc: PDFDoc, f: Finding) {
     .text(f.description, x, doc.y, { width: w });
   doc.moveDown(0.5);
 
+  // Context rows: a fixed label column on the left, wrapping text on the right.
+  // Renders the structured supporting observations (Still enforcing, Not
+  // configured, etc.) as discrete rows instead of one run-on sentence.
+  if (f.context && f.context.length > 0) {
+    const labelW = 82;
+    for (const d of f.context) {
+      doc.font('Helvetica').fontSize(9);
+      const rowH = doc.heightOfString(d.text, { width: w - labelW });
+      ensureRoom(doc, rowH + 4);
+      const rowY = doc.y;
+      doc.font('Helvetica-Bold').fontSize(7).fillColor(PDF_MUTED)
+        .text(d.label.toUpperCase(), x, rowY + 1.5, { width: labelW - 6, lineBreak: false });
+      doc.font('Helvetica').fontSize(9).fillColor(PDF_TEXT)
+        .text(d.text, x + labelW, rowY, { width: w - labelW });
+      doc.x = x;
+      doc.moveDown(0.25);
+    }
+    doc.moveDown(0.25);
+  }
+
   // Remediation block
   if (f.remediation) {
     const remY = doc.y;
@@ -1058,6 +1160,18 @@ function drawFinding(doc: PDFDoc, f: Finding) {
     doc.x = x;
   }
 
+  // Scope caveat: a muted italic footnote so it reads as a boundary note, not
+  // as part of the finding's verdict.
+  if (f.scopeNote) {
+    doc.font('Helvetica-Oblique').fontSize(8);
+    const sH = doc.heightOfString(`Scope: ${f.scopeNote}`, { width: w });
+    ensureRoom(doc, sH + 4);
+    doc.fillColor(PDF_MUTED)
+      .text(`Scope: ${f.scopeNote}`, x, doc.y, { width: w });
+    doc.x = x;
+    doc.moveDown(0.3);
+  }
+
   // Card separator with breathing room above and below so findings do not
   // visually run together.
   doc.moveDown(0.5);
@@ -1065,6 +1179,33 @@ function drawFinding(doc: PDFDoc, f: Finding) {
   doc.strokeColor(PDF_BORDER).lineWidth(0.5)
     .moveTo(x, sepY).lineTo(x + w, sepY).stroke();
   doc.y = sepY + 12;
+}
+
+// INCONCLUSIVE explainer callout, mirroring the terminal and HTML reports
+// (which already carry it). Rendered only when the run has INCONCLUSIVE
+// findings, just above the disclaimer.
+function drawInconclusiveNote(doc: PDFDoc) {
+  const x = doc.page.margins.left;
+  const w = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const padX = 10;
+  const padY = 8;
+  const text =
+    'About INCONCLUSIVE: the scanner could not verify these statically - typically ' +
+    'because of variables without defaults, SSM parameters, or module outputs. For ' +
+    'audit-grade evidence, run against `terraform show -json`.';
+
+  doc.moveDown(0.4);
+  doc.font('Helvetica').fontSize(8.5);
+  const innerW = w - padX * 2 - 3;
+  const h = doc.heightOfString(text, { width: innerW }) + padY * 2;
+  ensureRoom(doc, h + 6);
+  const y = doc.y;
+  doc.rect(x, y, w, h).fill(PDF_INCONCLUSIVE_BG);
+  doc.rect(x, y, 3, h).fill(PDF_STATUS_COLORS.INCONCLUSIVE);
+  doc.fillColor(PDF_INCONCLUSIVE_FG).font('Helvetica').fontSize(8.5)
+    .text(text, x + padX + 3, y + padY, { width: innerW });
+  doc.y = y + h + 8;
+  doc.x = x;
 }
 
 function drawDisclaimer(doc: PDFDoc) {
@@ -1149,6 +1290,7 @@ export async function formatPdf(findings: Finding[]): Promise<Buffer> {
     doc.moveDown(0.3);
   }
 
+  if (summary.inconclusive > 0) drawInconclusiveNote(doc);
   drawDisclaimer(doc);
 
   doc.end();

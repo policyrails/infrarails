@@ -1,7 +1,7 @@
 {
   "name": "infrarails",
-  "version": "0.3.0",
-  "description": "Static scanner for EU AI Act Article 9 & 12 compliance gaps in Terraform — checks AWS Bedrock guardrails, logging, retention, and traceability against EU AI Act, NIST AI RMF, and ISO/IEC 42001",
+  "version": "0.4.0",
+  "description": "Static scanner for EU AI Act Article 9 & 12 compliance gaps in Terraform and CloudFormation - checks AWS Bedrock guardrails, logging, retention, and traceability against EU AI Act, NIST AI RMF, and ISO/IEC 42001",
   "main": "dist/index.js",
   "bin": {
     "infrarails": "dist/index.js"

@@ -1,5 +1,42 @@
 # Release Notes
 
+## v0.4.0 - CloudFormation support (dual-IaC scanning)
+
+This release teaches infrarails to read **AWS CloudFormation** alongside Terraform. Every existing rule now runs unchanged against both dialects: CloudFormation templates (YAML/JSON, including SAM and `cdk synth` output) are normalised into the same internal representation the Terraform parser produces, so a mixed directory - a Terraform module next to a SAM template - scans as one estate. The release also adds report branding, restructures finding output into labelled context lines, and folds in SARIF and PDF fixes.
+
+### Added
+
+- **CloudFormation scanning.** `.yaml`, `.yml`, and `.json` templates are parsed, their intrinsics resolved where static, and fed through the same two-phase rule engine as Terraform. An inline `AWS::S3::Bucket` is split into the TF-shaped companion resources (encryption / versioning / lifecycle / object-lock) so the existing S3 rules evaluate it with no rule changes.
+- **`--input <mode>` flag** (`auto` | `tf` | `cfn`, default `auto`). `auto` detects dialect per file by extension **plus content shape** - a `.json` is treated as CloudFormation only if it declares `AWSTemplateFormatVersion`, a `Transform`, or a `Resources` map of `AWS::*` types, so a `package.json` or Kubernetes manifest is skipped rather than misparsed. `tf` / `cfn` force a single dialect for CI pipelines that need a hard guarantee about what was scanned.
+- **Static intrinsic resolution** for `!Ref` to defaulted parameters and all-static `!Sub` / `!Join` / `!FindInMap` / `!Select` / `!Split` / `!Base64`. Non-static intrinsics resolve to `INCONCLUSIVE` with a precise reason code: `cfn-import-value` (`Fn::ImportValue`), `cfn-dynamic-reference` (`{{resolve:ssm:...}}`), `cfn-pseudo-parameter`, and `cfn-fn-not-static` (`Fn::If` and friends).
+- **Mixed-source reports.** Each finding carries a `[terraform]` / `[cloudformation]` chip so a single report over a mixed estate stays unambiguous about which dialect a finding came from.
+- **infrarails branding** - an SVG logo now heads the README and the HTML / PDF reports.
+
+### CloudFormation honesty (deliberate INCONCLUSIVEs)
+
+The scanner stays conservative about what a static read of CloudFormation can and cannot prove:
+
+- **`Conditions` are never evaluated.** A resource guarded by `Condition:` may not exist at deploy time, so rules report it `INCONCLUSIVE` (`cfn-condition-gated`) rather than trusting its properties.
+- **Bedrock invocation logging cannot be declared in CloudFormation** - there is no CFN resource type for it (AWS's own pattern uses a Lambda-backed custom resource). When all Bedrock usage is CFN-sourced and no logging config is in scope, `S-12.1.1` stays `INCONCLUSIVE` even under `--strict-account-logging`, and the remediation points at `PutModelInvocationLoggingConfiguration` or a Terraform stack.
+- **Nested stacks** (`AWS::CloudFormation::Stack`) are treated like remote Terraform modules: not fetched, flagged by `S-12.x.5` when they look Bedrock-related. `Fn::ImportValue` of a baseline-named export counts as cross-stack evidence the same way `terraform_remote_state` does.
+- **A malformed file that plausibly *is* a CFN template is a hard error (exit `2`), not a silent skip.**
+- **`--plan` stays Terraform-only.** CloudFormation change sets are a separate, future feature.
+
+### Changed / Fixed
+
+- **Finding output restructured into labelled context lines.** Findings now carry structured `context[]` / `scopeNote` fields instead of concatenating supporting detail into one description string. The terminal / HTML / PDF formatters render these as aligned labelled rows (e.g. "Still enforcing", "Not configured", "Attachment", "Scope"), so the verdict line stays terse and the supporting evidence is scannable. Affects `S-9.x.3` and the Bedrock-logging findings.
+- **SARIF and PDF fixes** rolled in alongside the dual-IaC work, with new formatter regression tests.
+
+### Verification
+
+- **500/500 unit + e2e tests pass** (up from 397 in v0.3.0), including new CloudFormation suites: template parsing, intrinsic resolution, normalisation into the shared shape, presentation / chip rendering, end-to-end CFN scans, and mixed TF + CFN fixtures.
+
+### Docs
+
+- README gains a **Supported inputs** table, a CloudFormation-specifics section, and per-dialect verdict rows in "How the scanner handles your code"; ARCHITECTURE documents the normalisation layer. Sample PDF screenshots were regenerated against current output.
+
+---
+
 ## v0.3.0 — Guardrail-body enforcement (Article 9) and corrected retention citations
 
 This release completes the Bedrock guardrail progression — *presence → attachment → **body*** — with a new rule that inspects what a guardrail actually does, not just that one exists. It also corrects two regulatory citations to the Articles the obligations genuinely come from, fixes a finding-formatter bug that silently dropped articles from multi-citation rules, and makes `--plan` resolution more reliable for module-buried resources.

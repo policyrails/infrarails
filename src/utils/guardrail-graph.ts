@@ -47,14 +47,39 @@ export interface GuardrailGraph {
   guardrailToAgents: Map<string, string[]>;
 }
 
-// aws_bedrock_guardrail.<name>.(guardrail_id|id|arn) - the reference forms an
-// agent uses to wire a declared guardrail. Matched against the inner
-// expression after any `${...}` wrapper hcl2json emits is stripped.
-const GUARDRAIL_REF = /^aws_bedrock_guardrail\.([a-z_][a-z0-9_-]*)\.(?:guardrail_id|id|arn)$/i;
+// aws_bedrock_guardrail.<name>.(guardrail_id|id|arn|guardrail_arn) - the
+// reference forms an agent uses to wire a declared guardrail. Matched against
+// the inner expression after any `${...}` wrapper hcl2json emits is stripped.
+// `guardrail_arn` is the attribute a CFN `Fn::GetAtt [GR, GuardrailArn]` lowers
+// to (see pascalToSnake), so without it CFN-sourced attachments never resolve.
+const GUARDRAIL_REF = /^aws_bedrock_guardrail\.([a-z_][a-z0-9_-]*)\.(?:guardrail_id|id|arn|guardrail_arn)$/i;
+
+// aws_bedrock_guardrail_version.<name>.(version|id) - the reference an agent's
+// guardrail_version is wired to when it points at a published, numbered version
+// resource. A CFN `Fn::GetAtt [GRVersion, Version]` lowers to this shape, as
+// does a direct cross-resource reference in HCL.
+const GUARDRAIL_VERSION_REF =
+  /^aws_bedrock_guardrail_version\.([a-z_][a-z0-9_-]*)\.(?:version|id)$/i;
 
 function stripInterpolation(value: string): string {
   const match = value.match(/^\$\{(.+)\}$/);
   return match ? match[1].trim() : value;
+}
+
+/**
+ * True when `value` references an aws_bedrock_guardrail_version resource declared
+ * in scope. Such a reference proves the agent is pinned to a published, numbered
+ * (immutable) version even when the value string itself is known-after-apply -
+ * the same signal the cross-module config walk records as versionPin='versioned',
+ * applied to a direct reference (CFN Fn::GetAtt, or a same-template HCL ref).
+ */
+export function isDeclaredVersionReference(
+  value: unknown,
+  declaredVersions: Set<string>,
+): boolean {
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  const match = stripInterpolation(value).match(GUARDRAIL_VERSION_REF);
+  return match !== null && declaredVersions.has(match[1]);
 }
 
 /**

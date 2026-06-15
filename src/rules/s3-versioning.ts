@@ -1,5 +1,5 @@
 import { ScanRule, Finding, ParsedFile, ScanContext } from '../types';
-import { findResources, findResourceLine, getNestedValue, matchesBucket, inconclusiveFromUnresolved } from '../utils/resource-helpers';
+import { findResources, findResourceLine, getNestedValue, matchesBucket, inconclusiveFromUnresolved, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 
 export const s3VersioningRule: ScanRule = {
   id: 'S-12.x.1',
@@ -73,15 +73,36 @@ export const s3VersioningRule: ScanRule = {
 
       const hasObjectLock = !!objectLockMatch;
 
-      if (hasVersioning || hasObjectLock) {
-        const resource = versioningMatch || objectLockMatch!;
-        const resourceType = hasVersioning ? 'aws_s3_bucket_versioning' : 'aws_s3_bucket_object_lock_configuration';
+      // A Condition-guarded CFN control cannot firmly satisfy the check: it
+      // may not exist at deploy time. PASS only on an unconditional control;
+      // when the only satisfying control is conditional -> INCONCLUSIVE.
+      const versioningFirm = hasVersioning && !cfnConditionOf(versioningMatch!.body);
+      const objectLockFirm = hasObjectLock && !cfnConditionOf(objectLockMatch!.body);
+      if ((hasVersioning || hasObjectLock) && !versioningFirm && !objectLockFirm) {
+        const conditionalResource = hasVersioning ? versioningMatch! : objectLockMatch!;
+        const conditionalType = hasVersioning
+          ? 'aws_s3_bucket_versioning'
+          : 'aws_s3_bucket_object_lock_configuration';
+        findings.push(
+          inconclusiveConditional(this, {
+            label: `${hasVersioning ? 'Versioning' : 'Object Lock'} configuration for log bucket "${bucketName}"`,
+            condition: cfnConditionOf(conditionalResource.body)!,
+            filePath: conditionalResource.filePath,
+            line: findResourceLine(conditionalResource.rawHcl, conditionalType, conditionalResource.name),
+          }),
+        );
+        continue;
+      }
+
+      if (versioningFirm || objectLockFirm) {
+        const resource = (versioningFirm ? versioningMatch : objectLockMatch)!;
+        const resourceType = versioningFirm ? 'aws_s3_bucket_versioning' : 'aws_s3_bucket_object_lock_configuration';
         findings.push({
           ruleId: this.id,
           status: 'PASS',
           filePath: resource.filePath,
           line: findResourceLine(resource.rawHcl, resourceType, resource.name),
-          description: `Log bucket "${bucketName}" has ${hasVersioning ? 'versioning' : 'Object Lock'} enabled.`,
+          description: `Log bucket "${bucketName}" has ${versioningFirm ? 'versioning' : 'Object Lock'} enabled.`,
           remediation: '',
           regulatoryReference: this.regulatoryReference,
           nistReference: this.nistReference,

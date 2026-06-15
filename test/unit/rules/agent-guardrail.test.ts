@@ -220,6 +220,55 @@ describe('S-9.x.1 Bedrock Agent guardrail attachment', () => {
       expect(findings[0].description).toContain('guardrail_version');
     });
 
+    it('PASSes a reference identifier whose version is wired to an in-scope guardrail_version resource (CFN Fn::GetAtt form)', () => {
+      // Mirrors a CDK-synthesized template: GuardrailIdentifier !GetAtt GR.GuardrailArn,
+      // GuardrailVersion !GetAtt GRVersion.Version. Both values are known-after-apply,
+      // but the references name declared resources, so attachment + a numbered pin
+      // are verifiable - this is the case that was wrongly INCONCLUSIVE before.
+      const findings = agentGuardrailRule.run(
+        [
+          makeParsedFile({
+            aws_bedrockagent_agent: {
+              support_bot: [
+                agent({
+                  guardrail_identifier: '${aws_bedrock_guardrail.filter.guardrail_arn}',
+                  guardrail_version: '${aws_bedrock_guardrail_version.filter_v.version}',
+                }),
+              ],
+            },
+            aws_bedrock_guardrail: { filter: [{ name: 'content-filter' }] },
+            aws_bedrock_guardrail_version: { filter_v: [{ guardrail_identifier: 'x' }] },
+          }),
+        ],
+        emptyContext(),
+      );
+      expect(findings[0].status).toBe('PASS');
+      expect(findings[0].description).toContain('version pinned via aws_bedrock_guardrail_version');
+    });
+
+    it('stays INCONCLUSIVE when the version references a guardrail_version NOT in scope', () => {
+      // The version reference is well-formed but its target is not declared here,
+      // so the numbered pin cannot be verified - conservative INCONCLUSIVE, no false PASS.
+      const findings = agentGuardrailRule.run(
+        [
+          makeParsedFile({
+            aws_bedrockagent_agent: {
+              support_bot: [
+                agent({
+                  guardrail_identifier: '${aws_bedrock_guardrail.filter.guardrail_arn}',
+                  guardrail_version: '${aws_bedrock_guardrail_version.elsewhere.version}',
+                }),
+              ],
+            },
+            aws_bedrock_guardrail: { filter: [{ name: 'content-filter' }] },
+          }),
+        ],
+        emptyContext(),
+      );
+      expect(findings[0].status).toBe('INCONCLUSIVE');
+      expect(findings[0].description).toContain('guardrail_version');
+    });
+
     it('keeps a var-driven identifier INCONCLUSIVE (unchanged)', () => {
       const findings = agentGuardrailRule.run(
         [

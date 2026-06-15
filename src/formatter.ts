@@ -1,6 +1,11 @@
 import chalk from 'chalk';
 import { Finding, FindingStatus } from './types';
 import { allRules } from './rules';
+import { sourceOfPath } from './cfn/source';
+
+// Injected at build time by tsup, and by vitest's define (see tsup.config.ts /
+// vitest.config.ts), from package.json — single source of truth for the version.
+declare const __APP_VERSION__: string;
 
 interface ScanSummary {
   total: number;
@@ -133,6 +138,13 @@ export function formatTerminal(findings: Finding[]): string {
   const summary = summarize(findings);
   const groups = groupByStatus(findings);
 
+  // Per-finding dialect chip, shown only when the report mixes Terraform and
+  // CloudFormation sources - a single-dialect report stays exactly as before.
+  const dialects = new Set(
+    findings.map((f) => sourceOfPath(f.filePath)).filter((s) => s !== undefined),
+  );
+  const mixedSources = dialects.size > 1;
+
   lines.push('');
   lines.push(chalk.bold('InfraRails — Compliance Report'));
   lines.push(chalk.dim('EU AI Act Article 12  ·  NIST AI RMF  ·  ISO/IEC 42001'));
@@ -158,9 +170,24 @@ export function formatTerminal(findings: Finding[]): string {
         ? `${f.filePath}${f.line ? `:${f.line}` : ''}`
         : '';
 
-      lines.push(`${icon} ${chalk.bold(f.ruleId)}  ${f.description}`);
+      const sourceChip = mixedSources
+        ? (() => {
+            const dialect = sourceOfPath(f.filePath);
+            return dialect ? `${chalk.dim(`[${dialect}]`)} ` : '';
+          })()
+        : '';
+      lines.push(`${icon} ${chalk.bold(f.ruleId)}  ${sourceChip}${f.description}`);
       if (location) lines.push(`   ${chalk.dim(location)}`);
+
+      if (f.context && f.context.length > 0) {
+        const w = Math.max(...f.context.map((d) => d.label.length));
+        for (const d of f.context) {
+          lines.push(`   ${chalk.dim(`${d.label.padEnd(w)} ·`)} ${d.text}`);
+        }
+      }
+
       if (f.remediation) lines.push(`   ${chalk.cyan('→')} ${f.remediation}`);
+      if (f.scopeNote) lines.push(`   ${chalk.dim(`Scope: ${f.scopeNote}`)}`);
 
       const refs = findingRefs(f);
       if (refs.length > 0) lines.push(`   ${chalk.dim(compactRefLine(refs))}`);
@@ -181,7 +208,7 @@ export function formatTerminal(findings: Finding[]): string {
   lines.push(chalk.dim(
     'Disclaimer: This report reflects the findings of an automated static analysis of your AWS AI\n' +
     'infrastructure configuration against selected controls from the EU AI Act, NIST AI RMF, and\n' +
-    'ISO/IEC 42001. A passing result indicates that the scanned Terraform configuration satisfies\n' +
+    'ISO/IEC 42001. A passing result indicates that the scanned infrastructure-as-code configuration satisfies\n' +
     'the specific infrastructure-layer prerequisite checked - it does not constitute compliance with\n' +
     'any of these frameworks, nor does it substitute for a formal audit, certification, or conformity\n' +
     'assessment conducted by an accredited body. Compliance with the EU AI Act, NIST AI RMF, and\n' +
@@ -225,16 +252,17 @@ const SARIF_SCHEMA =
   'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json';
 const SARIF_VERSION = '2.1.0';
 const TOOL_NAME = 'infrarails';
-const TOOL_VERSION = '0.2.1';
-const TOOL_INFO_URI = 'https://github.com/vbalaji/infrarails';
+const TOOL_INFO_URI = 'https://github.com/policyrails/infrarails';
 
 type SarifLevel = 'none' | 'note' | 'warning' | 'error';
 type SarifKind = 'pass' | 'fail' | 'review' | 'notApplicable' | 'informational';
 
 // Status maps to two orthogonal SARIF fields:
-//   - kind  = the audit verdict (pass / fail / review / notApplicable)
+//   - kind  = the audit verdict (pass / fail / notApplicable)
 //   - level = the severity GitHub Code Scanning uses to colour the alert
-// INCONCLUSIVE → kind=review (SARIF's "needs human verification" bucket)
+// INCONCLUSIVE → level=warning + kind=fail (SARIF 3.27.9 requires level='none'
+// for any non-'fail' kind; we keep it visible as a warning, with the true
+// verdict preserved in properties.status).
 // SKIP → kind=notApplicable so it does not show up as an alert.
 function sarifLevel(status: FindingStatus): SarifLevel {
   switch (status) {
@@ -251,7 +279,10 @@ function sarifKind(status: FindingStatus): SarifKind {
     case 'PASS': return 'pass';
     case 'FAIL': return 'fail';
     case 'WARN': return 'fail';
-    case 'INCONCLUSIVE': return 'review';
+    // SARIF 3.27.9: when kind !== 'fail', level must be 'none'. sarifLevel keeps
+    // INCONCLUSIVE visible as 'warning', so kind must be 'fail' here to stay
+    // spec-legal; the true verdict is preserved in properties.status.
+    case 'INCONCLUSIVE': return 'fail';
     case 'SKIP': return 'notApplicable';
   }
 }
@@ -304,6 +335,11 @@ function sarifLocations(f: Finding): SarifLocation[] {
     physicalLocation: { artifactLocation: { uri: f.filePath } },
   };
   if (f.line && f.line > 0) {
+    // The SARIF `region` carries only `startLine` because the `Finding` type
+    // carries only `line` — there is no column/endLine data to emit. A precise
+    // highlight (`startColumn`/`endLine`/`endColumn`) would require extending
+    // `Finding` and threading column data out of every rule in src/rules/, a
+    // separate cross-cutting effort that is intentionally out of scope here.
     loc.physicalLocation.region = { startLine: f.line };
   }
   return [loc];
@@ -313,40 +349,70 @@ function sarifLocations(f: Finding): SarifLocation[] {
 // on the finding row, so we fold the description + remediation into a single
 // readable string instead of relying on properties bag.
 function sarifMessage(f: Finding): string {
-  if (f.remediation) return `${f.description}\n\nRemediation: ${f.remediation}`;
-  return f.description;
+  let msg = f.description;
+  if (f.context && f.context.length > 0) {
+    msg += '\n\n' + f.context.map((d) => `${d.label}: ${d.text}`).join('\n');
+  }
+  if (f.remediation) msg += `\n\nRemediation: ${f.remediation}`;
+  if (f.scopeNote) msg += `\n\nScope: ${f.scopeNote}`;
+  return msg;
 }
 
 // Stable per-finding fingerprint so GitHub Code Scanning can correlate the
-// same alert across re-runs even when line numbers shift slightly.
+// same alert across re-runs. The fingerprint is intentionally line-independent:
+// embedding the line number would change the fingerprint whenever code shifts
+// the line, defeating cross-run dedupe. We key on filePath only (which is
+// `plan:<address>` for plan-only findings, so those still get a stable identity).
 function partialFingerprints(f: Finding): Record<string, string> {
   return {
     'ruleId/v1': f.ruleId,
-    'location/v1': `${f.filePath ?? ''}:${f.line ?? ''}`,
+    'location/v1': f.filePath ?? '',
   };
 }
 
-export function formatSarif(findings: Finding[]): string {
+export function formatSarif(findings: Finding[], opts: { category?: string } = {}): string {
   // Build the rules section from the canonical rule registry so every rule
   // is described, not just ones with findings in this run. Ordered scanners
   // (CodeQL, ESLint, Semgrep) all do this — it gives consumers a stable
   // catalogue of what the tool can find.
-  const rules = allRules.map((r) => ({
-    id: r.id,
-    name: r.id,
-    shortDescription: { text: r.description },
-    fullDescription: { text: r.description },
-    helpUri: TOOL_INFO_URI,
-    defaultConfiguration: {
-      level: r.severity === 'FAIL' ? 'error' : 'warning',
-    },
-    properties: {
-      regulatoryReference: r.regulatoryReference,
-      ...(r.nistReference ? { nistReference: r.nistReference } : {}),
-      ...(r.isoReference ? { isoReference: r.isoReference } : {}),
-      tags: ['compliance', 'eu-ai-act', 'nist-ai-rmf', 'iso-42001'],
-    },
-  }));
+  const rules = allRules.map((r) => {
+    // Honest, per-rule tags: only advertise a framework when this rule actually
+    // maps to it, so tag-based filtering in consumers stays accurate. regulatory
+    // (EU AI Act) is always present; NIST/ISO are optional. The 'security' tag is
+    // what activates the per-rule security-severity in GitHub's Security tab, so
+    // every rule carries it.
+    const tags = ['compliance', 'security', 'eu-ai-act'];
+    if (r.nistReference) tags.push('nist-ai-rmf');
+    if (r.isoReference) tags.push('iso-42001');
+
+    // fullDescription is a strict superset of shortDescription: the same prose,
+    // then the framework citations appended so SARIF viewers that surface the
+    // long form show what the rule maps to without opening the properties bag.
+    let fullText = r.description + `\n\nMapped to: ${r.regulatoryReference}`;
+    if (r.nistReference) fullText += `; ${r.nistReference}`;
+    if (r.isoReference) fullText += `; ${r.isoReference}`;
+
+    return {
+      id: r.id,
+      name: r.id,
+      shortDescription: { text: r.description },
+      fullDescription: { text: fullText },
+      helpUri: TOOL_INFO_URI,
+      defaultConfiguration: {
+        level: r.severity === 'FAIL' ? 'error' : 'warning',
+      },
+      properties: {
+        regulatoryReference: r.regulatoryReference,
+        ...(r.nistReference ? { nistReference: r.nistReference } : {}),
+        ...(r.isoReference ? { isoReference: r.isoReference } : {}),
+        // GitHub Code Scanning only ranks/sorts alerts in the Security tab when
+        // each rule carries a numeric security-severity. FAIL = high (7.0),
+        // WARN = medium (4.0). Without it, all alerts land at a flat default.
+        'security-severity': r.severity === 'FAIL' ? '7.0' : '4.0',
+        tags,
+      },
+    };
+  });
 
   const ruleIndexById = new Map(allRules.map((r, i) => [r.id, i]));
 
@@ -394,11 +460,16 @@ export function formatSarif(findings: Finding[]): string {
         tool: {
           driver: {
             name: TOOL_NAME,
-            version: TOOL_VERSION,
+            version: __APP_VERSION__,
+            semanticVersion: __APP_VERSION__,
             informationUri: TOOL_INFO_URI,
             rules,
           },
         },
+        // GitHub Code Scanning "category" — disambiguates multiple upload-sarif
+        // uploads on the same commit (e.g. Terraform vs CloudFormation, or a
+        // build matrix). Without it, concurrent uploads silently overwrite.
+        automationDetails: { id: opts.category ?? TOOL_NAME },
         // GitHub Code Scanning anchors uriBaseId-bearing relative URIs against
         // the checkout root via the %SRCROOT% sentinel; the literal `file:///`
         // value is symbolic and ignored by GitHub but required by the SARIF
@@ -417,6 +488,19 @@ export function formatSarif(findings: Finding[]): string {
 // ─────────────────────────────────────────────────────────────────────
 // HTML
 // ─────────────────────────────────────────────────────────────────────
+
+// Inline brand mark (rails + brass check), matching infrarails.com. Two
+// variants: white rails on the dark masthead, navy rails for the light footer.
+const LOGO_SVG_DARK =
+  `<svg viewBox="0 0 32 32" width="24" height="24" aria-hidden="true">` +
+  `<path d="M4 12h24M4 19h24" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" opacity="0.45" fill="none"/>` +
+  `<path d="M9 16.5l5 5 9.5-11" stroke="#c9a14a" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>` +
+  `</svg>`;
+const LOGO_SVG_BRASS =
+  `<svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true">` +
+  `<path d="M4 12h24M4 19h24" stroke="#0c2d52" stroke-width="2.4" stroke-linecap="round" opacity="0.4" fill="none"/>` +
+  `<path d="M9 16.5l5 5 9.5-11" stroke="#b08a38" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>` +
+  `</svg>`;
 
 function escapeHtml(s: string): string {
   return s
@@ -447,6 +531,15 @@ function renderFindingCard(f: Finding): string {
     ? `<p class="remediation"><span class="arrow">&rarr;</span> ${escapeHtml(f.remediation)}</p>`
     : '';
 
+  const contextRows = f.context && f.context.length > 0
+    ? `<dl class="detail">${f.context
+        .map((d) => `<dt>${escapeHtml(d.label)}</dt><dd>${escapeHtml(d.text)}</dd>`)
+        .join('')}</dl>`
+    : '';
+  const scopeNote = f.scopeNote
+    ? `<p class="scope-note"><span class="scope-label">Scope</span> ${escapeHtml(f.scopeNote)}</p>`
+    : '';
+
   const refs = findingRefs(f);
   const refPills = refs
     .map((r) => {
@@ -468,7 +561,9 @@ function renderFindingCard(f: Finding): string {
           ${location}
         </div>
         <p class="description">${escapeHtml(f.description)}</p>
+        ${contextRows}
         ${remediation}
+        ${scopeNote}
         <div class="refs">${refPills}</div>
       </article>`;
 }
@@ -495,14 +590,14 @@ export function formatHtml(findings: Finding[]): string {
       const cards = items.map(renderFindingCard).join('\n');
       // Default-collapse PASS and SKIP - they're not what you came here for.
       const open = status === 'PASS' || status === 'SKIP' ? '' : ' open';
-      return `    <details class="group ${cls}"${open}>
-      <summary>
-        <span class="group-status ${cls}">${status}</span>
-        <span class="group-label">${STATUS_LABELS[status]}</span>
-        <span class="group-count">${items.length}</span>
-      </summary>
+      return `      <details class="group ${cls}"${open}>
+        <summary>
+          <span class="dot ${cls}"></span>
+          <span class="group-label">${STATUS_LABELS[status]}</span>
+          <span class="group-count">${items.length}</span>
+        </summary>
 ${cards}
-    </details>`;
+      </details>`;
     })
     .filter(Boolean)
     .join('\n');
@@ -516,163 +611,227 @@ ${cards}
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>InfraRails — Compliance Report</title>
+<title>Infrarails Compliance Report</title>
 <style>
   :root {
-    --pass: #16a34a; --fail: #dc2626; --warn: #d97706;
-    --skip: #6b7280; --inconclusive: #9333ea;
-    --bg: #f8fafc; --card: #ffffff; --border: #e5e7eb;
-    --text: #111827; --muted: #6b7280;
-    --eu: #1e40af; --nist: #0f766e; --iso: #7e22ce;
+    /* Brand (matches infrarails.com): navy + brass + white */
+    --navy: #0c2d52; --navy-deep: #081f3a; --navy-soft: #2b5586;
+    --brass: #c9a14a; --brass-dark: #9a7d2f;
+    --ink: #1c2733; --muted: #5a6b7d;
+    --tint: #f3f6fa; --line: #d8e1ec; --card: #ffffff;
+    /* Semantic verdict colours, tuned to sit beside the brand palette */
+    --pass: #1f9d57; --fail: #c8362f; --warn: #c98a1e;
+    --inconclusive: #5b53b5; --skip: #7a8896;
+    /* Framework accents, kept on-brand (navy / steel / brass) */
+    --eu: #0c2d52; --nist: #2b5586; --iso: #8a6d22;
+    --serif: Georgia, "Times New Roman", serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "SF Mono", SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
   }
   * { box-sizing: border-box; }
   body {
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--bg); color: var(--text);
-    margin: 0; padding: 2rem 1rem;
+    font-family: var(--sans); font-size: 15px; line-height: 1.6;
+    background: var(--tint); color: var(--ink); margin: 0;
   }
-  .container { max-width: 880px; margin: 0 auto; }
-  header.top { margin-bottom: 1.5rem; }
-  header.top h1 { font-size: 1.5rem; margin: 0; }
-  header.top .subtitle { color: var(--muted); margin: .25rem 0 0; font-size: .9rem; }
-  header.top .meta { color: var(--muted); font-size: .8rem; margin-top: .5rem; }
 
-  .summary-bar {
-    display: flex; flex-wrap: wrap; gap: 1.25rem;
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.5rem;
+  /* ---------- branded header band ---------- */
+  .masthead {
+    background: linear-gradient(180deg, var(--navy) 0%, var(--navy-deep) 100%);
+    color: #fff; padding: 30px 0 56px;
   }
-  .summary-bar .stat { display: flex; align-items: baseline; gap: .4rem; }
-  .summary-bar .count { font-size: 1.5rem; font-weight: 700; }
-  .summary-bar .label { color: var(--muted); font-size: .85rem; }
+  .container { max-width: 880px; margin: 0 auto; padding: 0 28px; }
+  .brandrow {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap;
+    border-bottom: 1px solid rgba(255,255,255,.14);
+    padding-bottom: 16px; margin-bottom: 22px;
+  }
+  .wordmark { display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--serif); font-size: 1.3rem; font-weight: bold;
+    letter-spacing: .01em; }
+  .wm-rails { color: var(--brass); }
+  .masthead .meta { font-size: .82rem; color: rgba(255,255,255,.66);
+    font-variant-numeric: tabular-nums; }
+  .masthead h1 {
+    font-family: var(--serif); font-weight: normal;
+    font-size: clamp(1.7rem, 4vw, 2.3rem); line-height: 1.15; margin: 0;
+  }
+  .masthead .subtitle { color: rgba(255,255,255,.74);
+    font-size: .92rem; margin: 10px 0 0; }
+
+  main { padding: 28px 0 56px; }
+
+  /* ---------- summary scorecard ---------- */
+  .summary-bar {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 6px; margin: -38px 0 28px;
+    box-shadow: 0 6px 24px rgba(8, 31, 58, .10);
+  }
+  .summary-bar .stat {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 14px 8px; border-radius: 7px; text-align: center;
+  }
+  .summary-bar .stat + .stat { border-left: 1px solid var(--line); }
+  .summary-bar .count { font-size: 1.9rem; font-weight: 700; line-height: 1;
+    font-variant-numeric: tabular-nums; }
+  .summary-bar .label { color: var(--muted); font-size: .78rem;
+    text-transform: uppercase; letter-spacing: .05em; margin-top: 7px; }
   .stat.pass .count { color: var(--pass); }
   .stat.fail .count { color: var(--fail); }
   .stat.warn .count { color: var(--warn); }
   .stat.inconclusive .count { color: var(--inconclusive); }
   .stat.skip .count { color: var(--skip); }
 
+  /* ---------- grouped sections ---------- */
   details.group {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 8px; margin-bottom: 1rem; overflow: hidden;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; margin-bottom: 14px; overflow: hidden;
   }
   details.group > summary {
-    list-style: none; cursor: pointer; padding: .85rem 1.25rem;
-    display: flex; align-items: center; gap: .75rem;
-    user-select: none;
+    list-style: none; cursor: pointer; padding: 15px 20px;
+    display: flex; align-items: center; gap: 12px; user-select: none;
   }
+  details.group > summary:hover { background: var(--tint); }
   details.group > summary::-webkit-details-marker { display: none; }
-  details.group > summary::before {
+  details.group > summary::after {
     content: '\\25B8'; color: var(--muted); transition: transform .15s;
-    display: inline-block; width: 1rem;
+    margin-left: 4px;
   }
-  details.group[open] > summary::before { transform: rotate(90deg); }
-  .group-status {
-    font-size: .7rem; font-weight: 700; letter-spacing: .05em;
-    padding: .2rem .55rem; border-radius: 4px; color: #fff;
-  }
-  .group-status.pass { background: var(--pass); }
-  .group-status.fail { background: var(--fail); }
-  .group-status.warn { background: var(--warn); }
-  .group-status.skip { background: var(--skip); }
-  .group-status.inconclusive { background: var(--inconclusive); }
-  .group-label { font-weight: 600; flex: 1; }
+  details.group[open] > summary::after { transform: rotate(90deg); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .dot.pass { background: var(--pass); }
+  .dot.fail { background: var(--fail); }
+  .dot.warn { background: var(--warn); }
+  .dot.skip { background: var(--skip); }
+  .dot.inconclusive { background: var(--inconclusive); }
+  .group-label { font-weight: 600; flex: 1; color: var(--navy); }
   .group-count {
-    background: #f3f4f6; color: var(--muted);
-    padding: .15rem .55rem; border-radius: 999px; font-size: .8rem; font-weight: 600;
+    background: var(--tint); color: var(--muted); border: 1px solid var(--line);
+    padding: .12rem .6rem; border-radius: 999px; font-size: .8rem; font-weight: 700;
+    font-variant-numeric: tabular-nums;
   }
 
-  .finding {
-    border-top: 1px solid var(--border);
-    padding: 1rem 1.25rem;
-  }
-  .finding-head { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-bottom: .35rem; }
+  /* ---------- finding cards ---------- */
+  .finding { border-top: 1px solid var(--line); padding: 16px 20px 16px 22px;
+    position: relative; }
+  .finding::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+    width: 3px; }
+  .finding.fail::before { background: var(--fail); }
+  .finding.warn::before { background: var(--warn); }
+  .finding.inconclusive::before { background: var(--inconclusive); }
+  .finding.pass::before { background: var(--pass); }
+  .finding.skip::before { background: var(--skip); }
+  .finding-head { display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap; margin-bottom: 6px; }
   .status-pill {
-    font-size: .65rem; font-weight: 700; letter-spacing: .05em;
-    padding: .15rem .45rem; border-radius: 3px; color: #fff;
+    font-size: .64rem; font-weight: 700; letter-spacing: .06em;
+    padding: .2rem .5rem; border-radius: 4px; color: #fff;
   }
   .status-pill.pass { background: var(--pass); }
   .status-pill.fail { background: var(--fail); }
   .status-pill.warn { background: var(--warn); }
   .status-pill.skip { background: var(--skip); }
   .status-pill.inconclusive { background: var(--inconclusive); }
-  .rule-id {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    font-weight: 600; font-size: .85rem;
-  }
-  .location {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    font-size: .75rem; color: var(--muted); margin-left: auto;
-  }
-  .description { margin: .35rem 0; }
+  .rule-id { font-family: var(--mono); font-weight: 600; font-size: .82rem;
+    color: var(--navy); background: var(--tint); border: 1px solid var(--line);
+    border-radius: 4px; padding: .1rem .45rem; }
+  .location { font-family: var(--mono); font-size: .74rem; color: var(--muted);
+    margin-left: auto; }
+  .description { margin: .3rem 0; color: var(--ink); }
   .remediation {
-    background: #ecfdf5; border-left: 3px solid var(--pass);
-    padding: .55rem .75rem; margin: .5rem 0; border-radius: 4px;
+    background: #f0f8f2; border-left: 3px solid var(--pass);
+    padding: .6rem .8rem; margin: .6rem 0 .2rem; border-radius: 0 6px 6px 0;
     font-size: .9rem;
   }
-  .remediation .arrow { color: var(--pass); font-weight: 700; margin-right: .35rem; }
+  .remediation .arrow { color: var(--pass); font-weight: 700; margin-right: .4rem; }
 
-  .refs {
-    display: flex; flex-wrap: wrap; gap: .65rem .85rem;
-    margin-top: .65rem; align-items: center;
-  }
-  .ref-group { display: inline-flex; align-items: center; gap: .3rem; flex-wrap: wrap; }
-  .fw-label { font-size: .7rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+  /* labeled supporting observations (context[]) */
+  .detail { display: grid; grid-template-columns: max-content 1fr;
+    gap: .25rem .8rem; margin: .55rem 0 .2rem; }
+  .detail dt { color: var(--muted); font-weight: 700; font-size: .66rem;
+    text-transform: uppercase; letter-spacing: .05em; padding-top: .15rem;
+    white-space: nowrap; }
+  .detail dd { margin: 0; color: var(--ink); font-size: .9rem; }
+  .scope-note { font-size: .8rem; color: var(--muted); margin: .55rem 0 .2rem;
+    line-height: 1.5; }
+  .scope-note .scope-label { font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; font-size: .66rem; margin-right: .45rem; color: var(--navy); }
+
+  .refs { display: flex; flex-wrap: wrap; gap: .55rem .9rem;
+    margin-top: .7rem; align-items: center; }
+  .ref-group { display: inline-flex; align-items: center; gap: .35rem; flex-wrap: wrap; }
+  .fw-label { font-size: .66rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .05em; font-weight: 700; }
   .pill {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    font-size: .72rem; padding: .12rem .45rem;
-    border-radius: 3px; cursor: help;
-    border: 1px solid;
+    font-family: var(--mono); font-size: .71rem; padding: .12rem .45rem;
+    border-radius: 4px; cursor: help; border: 1px solid;
   }
-  .pill.eu { background: #eff6ff; color: var(--eu); border-color: #bfdbfe; }
-  .pill.nist { background: #f0fdfa; color: var(--nist); border-color: #99f6e4; }
-  .pill.iso { background: #faf5ff; color: var(--iso); border-color: #e9d5ff; }
+  .pill.eu { background: #eef3f9; color: var(--eu); border-color: #c3d3e6; }
+  .pill.nist { background: #eef3f9; color: var(--nist); border-color: #c3d3e6; }
+  .pill.iso { background: #faf4e6; color: var(--iso); border-color: #ead7ad; }
 
   .note {
-    background: #faf5ff; border-left: 3px solid var(--inconclusive);
-    padding: .75rem 1rem; margin-top: 1.5rem; border-radius: 4px;
-    font-size: .85rem; color: #4b1d6f;
+    background: #f0eff8; border-left: 3px solid var(--inconclusive);
+    padding: .8rem 1rem; margin-top: 22px; border-radius: 0 6px 6px 0;
+    font-size: .85rem; color: #38336b;
   }
   .disclaimer {
-    background: #f8fafc; border: 1px solid var(--border); border-radius: 6px;
-    padding: .85rem 1rem; margin-top: 2rem;
-    font-size: .78rem; color: var(--muted); line-height: 1.6;
+    border-top: 1px solid var(--line); margin-top: 36px; padding-top: 18px;
+    font-size: .76rem; color: var(--muted); line-height: 1.65;
   }
-  .disclaimer strong { display: block; margin-bottom: .25rem; color: var(--text); }
-  code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
+  .disclaimer strong { display: block; margin-bottom: .3rem; color: var(--navy);
+    font-family: var(--serif); font-size: .92rem; }
+  .brandfoot { display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    color: var(--navy); font-family: var(--serif); font-weight: bold; font-size: 1rem; }
+  .brandfoot .wm-rails { color: var(--brass-dark); }
+  code { font-family: var(--mono); background: var(--tint);
+    border: 1px solid var(--line); padding: .08em .35em; border-radius: 3px;
+    font-size: .9em; }
 
   @media print {
-    body { background: #fff; padding: 0; font-size: 12px; }
-    details.group { box-shadow: none; page-break-inside: avoid; }
+    body { background: #fff; font-size: 12px; }
+    .masthead { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .summary-bar { box-shadow: none; }
+    details.group { page-break-inside: avoid; }
     details.group:not([open]) { display: none; }
     .pill { cursor: default; }
   }
 </style>
 </head>
 <body>
-<div class="container">
-  <header class="top">
-    <h1>InfraRails — Compliance Report</h1>
-    <p class="subtitle">EU AI Act Article 12 &middot; NIST AI RMF &middot; ISO/IEC 42001</p>
-    <p class="meta">${escapeHtml(generatedAt)} &middot; ${summary.total} findings</p>
+  <header class="masthead">
+    <div class="container">
+      <div class="brandrow">
+        <span class="wordmark">${LOGO_SVG_DARK}<span>Infra<span class="wm-rails">rails</span></span></span>
+        <span class="meta">${escapeHtml(generatedAt)} &middot; ${summary.total} findings</span>
+      </div>
+      <h1>Compliance Report</h1>
+      <p class="subtitle">EU AI Act &middot; NIST AI RMF &middot; ISO/IEC 42001</p>
+    </div>
   </header>
 
-  <div class="summary-bar">
-    <div class="stat fail"><span class="count">${summary.fail}</span><span class="label">failed</span></div>
-    <div class="stat warn"><span class="count">${summary.warn}</span><span class="label">warnings</span></div>
-    <div class="stat inconclusive"><span class="count">${summary.inconclusive}</span><span class="label">inconclusive</span></div>
-    <div class="stat pass"><span class="count">${summary.pass}</span><span class="label">passed</span></div>
-    <div class="stat skip"><span class="count">${summary.skip}</span><span class="label">skipped</span></div>
-  </div>
+  <main>
+    <div class="container">
+      <div class="summary-bar">
+        <div class="stat fail"><span class="count">${summary.fail}</span><span class="label">failed</span></div>
+        <div class="stat warn"><span class="count">${summary.warn}</span><span class="label">warnings</span></div>
+        <div class="stat inconclusive"><span class="count">${summary.inconclusive}</span><span class="label">inconclusive</span></div>
+        <div class="stat pass"><span class="count">${summary.pass}</span><span class="label">passed</span></div>
+        <div class="stat skip"><span class="count">${summary.skip}</span><span class="label">skipped</span></div>
+      </div>
 
 ${sections}
 
-  ${note}
+      ${note}
 
-  <div class="disclaimer">
-    <strong>Disclaimer</strong>
-    This report reflects the findings of an automated static analysis of your AWS AI infrastructure configuration against selected controls from the EU AI Act, NIST AI RMF, and ISO/IEC 42001. A passing result indicates that the scanned Terraform configuration satisfies the specific infrastructure-layer prerequisite checked - it does not constitute compliance with any of these frameworks, nor does it substitute for a formal audit, certification, or conformity assessment conducted by an accredited body. Compliance with the EU AI Act, NIST AI RMF, and ISO/IEC 42001 requires organisational, procedural, and governance measures that are outside the scope of infrastructure scanning. This report should be treated as a pre-audit readiness input, not an attestation of conformance.
-  </div>
-</div>
+      <div class="disclaimer">
+        <div class="brandfoot">${LOGO_SVG_BRASS}<span>Infra<span class="wm-rails">rails</span></span></div>
+        <strong>Disclaimer</strong>
+        This report reflects the findings of an automated static analysis of your AWS AI infrastructure configuration against selected controls from the EU AI Act, NIST AI RMF, and ISO/IEC 42001. A passing result indicates that the scanned infrastructure-as-code configuration satisfies the specific infrastructure-layer prerequisite checked - it does not constitute compliance with any of these frameworks, nor does it substitute for a formal audit, certification, or conformity assessment conducted by an accredited body. Compliance with the EU AI Act, NIST AI RMF, and ISO/IEC 42001 requires organisational, procedural, and governance measures that are outside the scope of infrastructure scanning. This report should be treated as a pre-audit readiness input, not an attestation of conformance.
+      </div>
+    </div>
+  </main>
 </body>
 </html>
 `;
@@ -689,29 +848,39 @@ ${sections}
 // simpler than the HTML version but matches the same visual language: status
 // pills, framework-coloured ref pills, and grouped sections.
 
+// Brand palette (matches infrarails.com): navy + brass + white.
+const PDF_NAVY = '#0c2d52';
+const PDF_NAVY_DEEP = '#081f3a';
+const PDF_BRASS = '#c9a14a';
+const PDF_BRASS_DARK = '#9a7d2f';
+
 const PDF_STATUS_COLORS: Record<FindingStatus, string> = {
-  PASS: '#16a34a',
-  FAIL: '#dc2626',
-  WARN: '#d97706',
-  SKIP: '#6b7280',
-  INCONCLUSIVE: '#9333ea',
+  PASS: '#1f9d57',
+  FAIL: '#c8362f',
+  WARN: '#c98a1e',
+  SKIP: '#7a8896',
+  INCONCLUSIVE: '#5b53b5',
 };
 
+// Framework accents kept on-brand: navy / steel for EU & NIST, brass for ISO.
 const PDF_FRAMEWORK_FG: Record<string, string> = {
-  'EU AI Act': '#1e40af',
-  'NIST AI RMF': '#0f766e',
-  'ISO/IEC 42001': '#7e22ce',
+  'EU AI Act': '#0c2d52',
+  'NIST AI RMF': '#2b5586',
+  'ISO/IEC 42001': '#8a6d22',
 };
 const PDF_FRAMEWORK_BG: Record<string, string> = {
-  'EU AI Act': '#eff6ff',
-  'NIST AI RMF': '#f0fdfa',
-  'ISO/IEC 42001': '#faf5ff',
+  'EU AI Act': '#eef3f9',
+  'NIST AI RMF': '#eef3f9',
+  'ISO/IEC 42001': '#faf4e6',
 };
 
-const PDF_TEXT = '#111827';
-const PDF_MUTED = '#6b7280';
-const PDF_BORDER = '#e5e7eb';
-const PDF_REMEDIATION_BG = '#ecfdf5';
+const PDF_TEXT = '#1c2733';
+const PDF_MUTED = '#5a6b7d';
+const PDF_BORDER = '#d8e1ec';
+const PDF_TINT = '#f3f6fa';
+const PDF_REMEDIATION_BG = '#f0f8f2';
+const PDF_INCONCLUSIVE_BG = '#f0eff8';
+const PDF_INCONCLUSIVE_FG = '#38336b';
 
 type PDFDoc = PDFKit.PDFDocument;
 
@@ -742,42 +911,111 @@ function drawPill(
   return w;
 }
 
+// Draw the brand mark (two rails + brass check) at native scale, matching the
+// inline SVG on infrarails.com. Stroked vector primitives only - no raster.
+function drawLogoMark(
+  doc: PDFDoc,
+  x: number,
+  y: number,
+  size: number,
+  railColor: string,
+  railOpacity: number,
+  checkColor: string,
+) {
+  const s = size / 32;
+  doc.save();
+  doc.lineCap('round').lineJoin('round');
+  doc.lineWidth(2.4 * s).strokeColor(railColor).strokeOpacity(railOpacity);
+  doc.moveTo(x + 4 * s, y + 12 * s).lineTo(x + 28 * s, y + 12 * s).stroke();
+  doc.moveTo(x + 4 * s, y + 19 * s).lineTo(x + 28 * s, y + 19 * s).stroke();
+  doc.strokeOpacity(1).lineWidth(3.2 * s).strokeColor(checkColor);
+  doc
+    .moveTo(x + 9 * s, y + 16.5 * s)
+    .lineTo(x + 14 * s, y + 21.5 * s)
+    .lineTo(x + 23.5 * s, y + 10.5 * s)
+    .stroke();
+  doc.restore();
+}
+
+// Full-bleed navy masthead with logo, wordmark, title and a brass accent rule.
+// Leaves doc.y just above the band's lower edge so the summary scorecard can
+// float over it, mirroring the website's overlapping hero/card composition.
 function drawHeader(doc: PDFDoc, total: number, generatedAt: string) {
-  doc.font('Helvetica-Bold').fontSize(20).fillColor(PDF_TEXT)
-    .text('InfraRails — Compliance Report');
-  doc.moveDown(0.2);
-  doc.font('Helvetica').fontSize(10).fillColor(PDF_MUTED)
-    .text('EU AI Act Article 12  ·  NIST AI RMF  ·  ISO/IEC 42001');
-  doc.fontSize(9).fillColor(PDF_MUTED)
-    .text(`${generatedAt}  ·  ${total} findings`);
-  doc.moveDown(0.8);
+  const pageW = doc.page.width;
+  const left = doc.page.margins.left;
+  const right = pageW - doc.page.margins.right;
+  const bandH = 118;
+
+  doc.save();
+  const grad = doc.linearGradient(0, 0, 0, bandH);
+  grad.stop(0, PDF_NAVY).stop(1, PDF_NAVY_DEEP);
+  doc.rect(0, 0, pageW, bandH).fill(grad);
+  doc.restore();
+
+  // Logo + wordmark, top-left.
+  drawLogoMark(doc, left, 24, 22, '#ffffff', 0.45, PDF_BRASS);
+  doc.font('Times-Bold').fontSize(15);
+  doc.fillColor('#ffffff').text('Infra', left + 30, 28, {
+    lineBreak: false,
+    continued: true,
+  });
+  doc.fillColor(PDF_BRASS).text('rails', { lineBreak: false });
+
+  // Run metadata, top-right on the same row.
+  doc.font('Helvetica').fontSize(8.5).fillColor('#9fb3cc')
+    .text(`${generatedAt}  ·  ${total} findings`, left, 31, {
+      width: right - left,
+      align: 'right',
+      lineBreak: false,
+    });
+
+  // Title + framework subtitle.
+  doc.font('Times-Bold').fontSize(24).fillColor('#ffffff')
+    .text('Compliance Report', left, 50, { lineBreak: false });
+  doc.font('Helvetica').fontSize(9.5).fillColor('#b9c8db')
+    .text('EU AI Act  ·  NIST AI RMF  ·  ISO/IEC 42001', left, 81, {
+      lineBreak: false,
+    });
+
+  // Brass accent rule along the band's lower edge.
+  doc.rect(0, bandH - 2.5, pageW, 2.5).fill(PDF_BRASS);
+
+  // Sit just above the edge so the scorecard overlaps the band, leaving
+  // clearance below the subtitle so the card never covers it.
+  doc.y = bandH - 12;
+  doc.x = left;
 }
 
 function drawSummaryBar(doc: PDFDoc, s: ScanSummary) {
   const x = doc.page.margins.left;
   const y = doc.y;
   const w = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-  const h = 52;
+  const h = 58;
 
-  doc.roundedRect(x, y, w, h, 6).fillAndStroke('#f8fafc', PDF_BORDER);
+  doc.roundedRect(x, y, w, h, 8).fillAndStroke('#ffffff', PDF_BORDER);
 
   const stats: { count: number; label: string; color: string }[] = [
-    { count: s.fail, label: 'failed', color: PDF_STATUS_COLORS.FAIL },
-    { count: s.warn, label: 'warnings', color: PDF_STATUS_COLORS.WARN },
-    { count: s.inconclusive, label: 'inconclusive', color: PDF_STATUS_COLORS.INCONCLUSIVE },
-    { count: s.pass, label: 'passed', color: PDF_STATUS_COLORS.PASS },
-    { count: s.skip, label: 'skipped', color: PDF_STATUS_COLORS.SKIP },
+    { count: s.fail, label: 'FAILED', color: PDF_STATUS_COLORS.FAIL },
+    { count: s.warn, label: 'WARNINGS', color: PDF_STATUS_COLORS.WARN },
+    { count: s.inconclusive, label: 'INCONCLUSIVE', color: PDF_STATUS_COLORS.INCONCLUSIVE },
+    { count: s.pass, label: 'PASSED', color: PDF_STATUS_COLORS.PASS },
+    { count: s.skip, label: 'SKIPPED', color: PDF_STATUS_COLORS.SKIP },
   ];
   const cellW = w / stats.length;
   stats.forEach((st, i) => {
     const cx = x + i * cellW;
-    doc.font('Helvetica-Bold').fontSize(18).fillColor(st.color)
-      .text(String(st.count), cx, y + 8, { width: cellW, align: 'center', lineBreak: false });
-    doc.font('Helvetica').fontSize(9).fillColor(PDF_MUTED)
-      .text(st.label, cx, y + 32, { width: cellW, align: 'center', lineBreak: false });
+    // Hairline dividers between cells (not before the first).
+    if (i > 0) {
+      doc.strokeColor(PDF_BORDER).lineWidth(0.5)
+        .moveTo(cx, y + 12).lineTo(cx, y + h - 12).stroke();
+    }
+    doc.font('Helvetica-Bold').fontSize(20).fillColor(st.color)
+      .text(String(st.count), cx, y + 11, { width: cellW, align: 'center', lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(7).fillColor(PDF_MUTED)
+      .text(st.label, cx, y + 38, { width: cellW, align: 'center', lineBreak: false });
   });
 
-  doc.y = y + h + 12;
+  doc.y = y + h + 16;
   doc.x = doc.page.margins.left;
 }
 
@@ -787,27 +1025,29 @@ function drawSectionHeader(doc: PDFDoc, status: FindingStatus, count: number) {
   const y = doc.y;
   const w = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const h = 26;
-  const padX = 12;
-  const gap = 14;
+  const padX = 14;
+  const color = PDF_STATUS_COLORS[status];
 
-  doc.roundedRect(x, y, w, h, 4).fill(PDF_STATUS_COLORS[status]);
+  // Light tint plate with a status-coloured accent bar on the left edge -
+  // calmer than the old full-bleed colour fill, easier to scan a long report.
+  doc.roundedRect(x, y, w, h, 5).fillAndStroke(PDF_TINT, PDF_BORDER);
+  doc.save();
+  doc.roundedRect(x, y, w, h, 5).clip();
+  doc.rect(x, y, 4, h).fill(color);
+  doc.restore();
 
-  // Status word - measure width so we can place the label dynamically.
-  // "INCONCLUSIVE" at Helvetica-Bold 10pt is wider than the old hardcoded 60pt
-  // gap, which caused it to overprint the label text.
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#ffffff');
-  const statusW = doc.widthOfString(status);
-  doc.text(status, x + padX, y + 8, { lineBreak: false });
+  // Status dot.
+  doc.circle(x + padX, y + h / 2, 3.5).fill(color);
 
-  doc.font('Helvetica').fontSize(10).fillColor('#ffffff')
-    .text(STATUS_LABELS[status], x + padX + statusW + gap, y + 8, {
-      lineBreak: false,
-    });
+  // Section label in navy.
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PDF_NAVY)
+    .text(STATUS_LABELS[status], x + padX + 10, y + 8, { lineBreak: false });
 
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#ffffff')
+  // Count, right-aligned.
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PDF_MUTED)
     .text(String(count), x, y + 8, { width: w - padX, align: 'right', lineBreak: false });
 
-  doc.y = y + h + 10;
+  doc.y = y + h + 12;
   doc.x = doc.page.margins.left;
 }
 
@@ -823,8 +1063,8 @@ function drawFinding(doc: PDFDoc, f: Finding) {
   const pillW = drawPill(
     doc, x, headY, f.status, PDF_STATUS_COLORS[f.status], '#ffffff', 8,
   );
-  // Rule ID (mono) - right of the pill on the same row
-  doc.font('Courier-Bold').fontSize(9).fillColor(PDF_TEXT)
+  // Rule ID (mono, navy) - right of the pill on the same row
+  doc.font('Courier-Bold').fontSize(9).fillColor(PDF_NAVY)
     .text(f.ruleId, x + pillW + 6, headY + 2, { lineBreak: false });
 
   doc.y = headY + 16;
@@ -846,6 +1086,26 @@ function drawFinding(doc: PDFDoc, f: Finding) {
   doc.font('Helvetica').fontSize(9.5).fillColor(PDF_TEXT)
     .text(f.description, x, doc.y, { width: w });
   doc.moveDown(0.5);
+
+  // Context rows: a fixed label column on the left, wrapping text on the right.
+  // Renders the structured supporting observations (Still enforcing, Not
+  // configured, etc.) as discrete rows instead of one run-on sentence.
+  if (f.context && f.context.length > 0) {
+    const labelW = 82;
+    for (const d of f.context) {
+      doc.font('Helvetica').fontSize(9);
+      const rowH = doc.heightOfString(d.text, { width: w - labelW });
+      ensureRoom(doc, rowH + 4);
+      const rowY = doc.y;
+      doc.font('Helvetica-Bold').fontSize(7).fillColor(PDF_MUTED)
+        .text(d.label.toUpperCase(), x, rowY + 1.5, { width: labelW - 6, lineBreak: false });
+      doc.font('Helvetica').fontSize(9).fillColor(PDF_TEXT)
+        .text(d.text, x + labelW, rowY, { width: w - labelW });
+      doc.x = x;
+      doc.moveDown(0.25);
+    }
+    doc.moveDown(0.25);
+  }
 
   // Remediation block
   if (f.remediation) {
@@ -900,6 +1160,18 @@ function drawFinding(doc: PDFDoc, f: Finding) {
     doc.x = x;
   }
 
+  // Scope caveat: a muted italic footnote so it reads as a boundary note, not
+  // as part of the finding's verdict.
+  if (f.scopeNote) {
+    doc.font('Helvetica-Oblique').fontSize(8);
+    const sH = doc.heightOfString(`Scope: ${f.scopeNote}`, { width: w });
+    ensureRoom(doc, sH + 4);
+    doc.fillColor(PDF_MUTED)
+      .text(`Scope: ${f.scopeNote}`, x, doc.y, { width: w });
+    doc.x = x;
+    doc.moveDown(0.3);
+  }
+
   // Card separator with breathing room above and below so findings do not
   // visually run together.
   doc.moveDown(0.5);
@@ -909,6 +1181,33 @@ function drawFinding(doc: PDFDoc, f: Finding) {
   doc.y = sepY + 12;
 }
 
+// INCONCLUSIVE explainer callout, mirroring the terminal and HTML reports
+// (which already carry it). Rendered only when the run has INCONCLUSIVE
+// findings, just above the disclaimer.
+function drawInconclusiveNote(doc: PDFDoc) {
+  const x = doc.page.margins.left;
+  const w = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const padX = 10;
+  const padY = 8;
+  const text =
+    'About INCONCLUSIVE: the scanner could not verify these statically - typically ' +
+    'because of variables without defaults, SSM parameters, or module outputs. For ' +
+    'audit-grade evidence, run against `terraform show -json`.';
+
+  doc.moveDown(0.4);
+  doc.font('Helvetica').fontSize(8.5);
+  const innerW = w - padX * 2 - 3;
+  const h = doc.heightOfString(text, { width: innerW }) + padY * 2;
+  ensureRoom(doc, h + 6);
+  const y = doc.y;
+  doc.rect(x, y, w, h).fill(PDF_INCONCLUSIVE_BG);
+  doc.rect(x, y, 3, h).fill(PDF_STATUS_COLORS.INCONCLUSIVE);
+  doc.fillColor(PDF_INCONCLUSIVE_FG).font('Helvetica').fontSize(8.5)
+    .text(text, x + padX + 3, y + padY, { width: innerW });
+  doc.y = y + h + 8;
+  doc.x = x;
+}
+
 function drawDisclaimer(doc: PDFDoc) {
   ensureRoom(doc, 90);
   const x = doc.page.margins.left;
@@ -916,7 +1215,7 @@ function drawDisclaimer(doc: PDFDoc) {
   const text =
     'This report reflects the findings of an automated static analysis of your AWS AI infrastructure ' +
     'configuration against selected controls from the EU AI Act, NIST AI RMF, and ISO/IEC 42001. ' +
-    'A passing result indicates that the scanned Terraform configuration satisfies the specific ' +
+    'A passing result indicates that the scanned infrastructure-as-code configuration satisfies the specific ' +
     'infrastructure-layer prerequisite checked - it does not constitute compliance with any of these ' +
     'frameworks, nor does it substitute for a formal audit, certification, or conformity assessment ' +
     'conducted by an accredited body. Compliance with the EU AI Act, NIST AI RMF, and ISO/IEC 42001 ' +
@@ -924,16 +1223,27 @@ function drawDisclaimer(doc: PDFDoc) {
     'infrastructure scanning. This report should be treated as a pre-audit readiness input, not an ' +
     'attestation of conformance.';
 
-  doc.moveDown(0.5);
-  const y = doc.y;
-  doc.font('Helvetica').fontSize(8).fillColor(PDF_MUTED);
-  const h = doc.heightOfString(text, { width: w - 16 }) + 28;
-  doc.roundedRect(x, y, w, h, 4).fillAndStroke('#f8fafc', PDF_BORDER);
-  doc.font('Helvetica-Bold').fontSize(9).fillColor(PDF_TEXT)
-    .text('Disclaimer', x + 8, y + 8, { lineBreak: false });
+  doc.moveDown(0.8);
+  // Brand sign-off above a hairline rule.
+  const brandY = doc.y;
+  drawLogoMark(doc, x, brandY - 1, 16, PDF_NAVY, 0.4, PDF_BRASS_DARK);
+  doc.font('Times-Bold').fontSize(11);
+  doc.fillColor(PDF_NAVY).text('Infra', x + 22, brandY, {
+    lineBreak: false,
+    continued: true,
+  });
+  doc.fillColor(PDF_BRASS_DARK).text('rails', { lineBreak: false });
+
+  const ruleY = brandY + 20;
+  doc.strokeColor(PDF_BORDER).lineWidth(0.5)
+    .moveTo(x, ruleY).lineTo(x + w, ruleY).stroke();
+
+  const y = ruleY + 10;
+  doc.font('Times-Bold').fontSize(10).fillColor(PDF_NAVY)
+    .text('Disclaimer', x, y, { lineBreak: false });
   doc.font('Helvetica').fontSize(8).fillColor(PDF_MUTED)
-    .text(text, x + 8, y + 22, { width: w - 16 });
-  doc.y = y + h;
+    .text(text, x, y + 16, { width: w });
+  doc.y = doc.y + 4;
 }
 
 export async function formatPdf(findings: Finding[]): Promise<Buffer> {
@@ -951,8 +1261,9 @@ export async function formatPdf(findings: Finding[]): Promise<Buffer> {
     size: 'A4',
     margin: 50,
     info: {
-      Title: 'InfraRails — Compliance Report',
+      Title: 'Infrarails Compliance Report',
       Producer: 'infrarails',
+      Author: 'Infrarails',
     },
   });
 
@@ -979,6 +1290,7 @@ export async function formatPdf(findings: Finding[]): Promise<Buffer> {
     doc.moveDown(0.3);
   }
 
+  if (summary.inconclusive > 0) drawInconclusiveNote(doc);
   drawDisclaimer(doc);
 
   doc.end();

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildGuardrailGraph } from '../../src/utils/guardrail-graph';
+import { buildGuardrailGraph, isDeclaredVersionReference } from '../../src/utils/guardrail-graph';
 import { parsePlanObject } from '../../src/plan-parser';
 import { makeParsedFile } from './rules/helpers';
 
@@ -23,6 +23,22 @@ describe('buildGuardrailGraph', () => {
     const files = [
       makeParsedFile({
         aws_bedrockagent_agent: { support_bot: [agent('support-bot', ref('filter'))] },
+        aws_bedrock_guardrail: { filter: [{ name: 'content-filter' }] },
+      }),
+    ];
+
+    const { agentToGuardrail, guardrailToAgents } = buildGuardrailGraph(files);
+
+    expect(agentToGuardrail.get('support_bot')).toEqual({ kind: 'declared', guardrail: 'filter' });
+    expect(guardrailToAgents.get('filter')).toEqual(['support_bot']);
+  });
+
+  it('links a reference via the guardrail_arn attribute (CFN Fn::GetAtt form)', () => {
+    // A CFN `GuardrailIdentifier: !GetAtt GR.GuardrailArn` lowers to
+    // ${aws_bedrock_guardrail.GR.guardrail_arn} - it must resolve like .id/.guardrail_id.
+    const files = [
+      makeParsedFile({
+        aws_bedrockagent_agent: { support_bot: [agent('support-bot', ref('filter', 'guardrail_arn'))] },
         aws_bedrock_guardrail: { filter: [{ name: 'content-filter' }] },
       }),
     ];
@@ -114,6 +130,22 @@ describe('buildGuardrailGraph', () => {
     const { guardrailToAgents } = buildGuardrailGraph(files);
 
     expect(guardrailToAgents.get('filter')).toEqual(['support_bot', 'billing_bot']);
+  });
+
+  it('isDeclaredVersionReference: true only for a reference to an in-scope version resource', () => {
+    const declared = new Set(['recruiter_v']);
+    // Direct reference (both interpolation-wrapped and bare) to a declared version.
+    expect(isDeclaredVersionReference('${aws_bedrock_guardrail_version.recruiter_v.version}', declared)).toBe(true);
+    expect(isDeclaredVersionReference('aws_bedrock_guardrail_version.recruiter_v.version', declared)).toBe(true);
+    expect(isDeclaredVersionReference('${aws_bedrock_guardrail_version.recruiter_v.id}', declared)).toBe(true);
+    // Reference to a version resource NOT in scope -> not a verifiable pin.
+    expect(isDeclaredVersionReference('${aws_bedrock_guardrail_version.elsewhere.version}', declared)).toBe(false);
+    // Literal versions, plain var refs, empty, and non-strings are not pins.
+    expect(isDeclaredVersionReference('1', declared)).toBe(false);
+    expect(isDeclaredVersionReference('DRAFT', declared)).toBe(false);
+    expect(isDeclaredVersionReference('${var.gr_version}', declared)).toBe(false);
+    expect(isDeclaredVersionReference('', declared)).toBe(false);
+    expect(isDeclaredVersionReference(undefined, declared)).toBe(false);
   });
 
   it('returns empty maps when there are no agents', () => {

@@ -1,5 +1,5 @@
 import { ScanRule, Finding, ParsedFile, ScanContext } from '../types';
-import { findResources, findResourceLine, getNestedValue, matchesBucket, inconclusiveFromUnresolved } from '../utils/resource-helpers';
+import { findResources, findResourceLine, getNestedValue, matchesBucket, inconclusiveFromUnresolved, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 
 const MIN_RETENTION_DAYS = 180;
@@ -90,6 +90,20 @@ export const s3LifecycleRule: ScanRule = {
       }
 
       const line = findResourceLine(matching.rawHcl, 'aws_s3_bucket_lifecycle_configuration', matching.name);
+
+      // Condition-guarded CFN lifecycle config may not exist at deploy time.
+      const condition = cfnConditionOf(matching.body);
+      if (condition) {
+        findings.push(
+          inconclusiveConditional(this, {
+            label: `Lifecycle configuration for bucket "${bucketName}"`,
+            condition,
+            filePath: matching.filePath,
+            line,
+          }),
+        );
+        continue;
+      }
 
       // Check lifecycle rules for expiration days
       const rules = getNestedValue(matching.body, 'rule');

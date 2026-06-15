@@ -5,6 +5,7 @@ import {
   findBedrockDataSources,
   findIamBedrockGrants,
   findBedrockVpcEndpoints,
+  cfnConditionOf,
 } from '../utils/resource-helpers';
 
 const REGULATORY_REFERENCE = 'EU AI Act Article 9 - Risk management system for high-risk AI systems';
@@ -16,7 +17,7 @@ const ISO_REFERENCE =
 const RATIONALE =
   'Bedrock Guardrails are the AWS-native enforcement point for content filters, denied topics, ' +
   'PII redaction, and grounding checks. Article 9 requires an operative risk-management system ' +
-  'for high-risk AI; deploying Bedrock without any guardrail declared in the same Terraform tree ' +
+  'for high-risk AI; deploying Bedrock without any guardrail declared in the scanned IaC ' +
   'leaves the scanner unable to confirm that a control surface exists at all.';
 
 // Companion to S-9.x.1. S-9.x.1 verifies guardrail *attachment* on Bedrock
@@ -37,7 +38,7 @@ const RATIONALE =
 // that names both possibilities is the honest signal.
 const NO_GUARDRAIL_REMEDIATION =
   'Either declare an aws_bedrock_guardrail (and aws_bedrock_guardrail_version) ' +
-  'in this Terraform tree and reference it from your Bedrock Agents (see S-9.x.1) ' +
+  'in the scanned IaC and reference it from your Bedrock Agents (see S-9.x.1) ' +
   'or, for SDK-driven InvokeModel/Converse calls, pass the guardrailIdentifier ' +
   'parameter on every call. If guardrails are defined in a separate security/' +
   'platform stack, scan that stack too or document the cross-stack arrangement. ' +
@@ -47,12 +48,12 @@ const PASS_RUNTIME_CAVEAT =
   'Note: this confirms a guardrail is declared in IaC, not that it is attached ' +
   'to every model invocation. SDK-driven InvokeModel/Converse calls must still ' +
   'pass guardrailIdentifier in application code; that is not verifiable from ' +
-  'Terraform. See S-9.x.1 for Agent-attachment verification.';
+  'IaC. See S-9.x.1 for Agent-attachment verification.';
 
 export const guardrailPresenceRule: ScanRule = {
   id: 'S-9.x.2',
   description:
-    'When Bedrock is in use, at least one aws_bedrock_guardrail should be declared in scanned Terraform (presence-level signal; attachment is covered by S-9.x.1 for Agents and is application-code-only for raw SDK calls)',
+    'When Bedrock is in use, at least one aws_bedrock_guardrail should be declared in scanned IaC (presence-level signal; attachment is covered by S-9.x.1 for Agents and is application-code-only for raw SDK calls)',
   severity: 'WARN',
   regulatoryReference: REGULATORY_REFERENCE,
   nistReference: NIST_REFERENCE,
@@ -124,7 +125,7 @@ export const guardrailPresenceRule: ScanRule = {
           ruleId: this.id,
           status: 'WARN',
           filePath: triggerPath,
-          description: `Bedrock usage detected (${signals.join(', ')}) but no aws_bedrock_guardrail resource is declared anywhere in the scanned Terraform.`,
+          description: `Bedrock usage detected (${signals.join(', ')}) but no aws_bedrock_guardrail resource is declared anywhere in the scanned IaC.`,
           remediation: NO_GUARDRAIL_REMEDIATION,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
@@ -133,12 +134,41 @@ export const guardrailPresenceRule: ScanRule = {
       ];
     }
 
+    // A Condition-guarded CFN guardrail may not exist at deploy time, so it
+    // cannot firmly satisfy the presence check. PASS needs at least one
+    // unconditional guardrail; conditional-only -> INCONCLUSIVE.
+    const firmGuardrails = guardrails.filter((g) => !cfnConditionOf(g.body));
+    if (firmGuardrails.length === 0) {
+      const conditions = guardrails
+        .map((g) => `"${g.name}" (Condition "${cfnConditionOf(g.body)}")`)
+        .join(', ');
+      return [
+        {
+          ruleId: this.id,
+          status: 'INCONCLUSIVE',
+          filePath: guardrails[0].filePath,
+          description:
+            `Bedrock usage detected, and the only declared guardrail(s) are created ` +
+            `conditionally: ${conditions}. Static scanning cannot determine whether any ` +
+            `guardrail will exist at deploy time.`,
+          remediation:
+            'Evaluate the stack with the intended parameter values (e.g. via a change set), ' +
+            'or declare an unconditional guardrail for the Bedrock workload. ' +
+            NO_GUARDRAIL_REMEDIATION,
+          regulatoryReference: REGULATORY_REFERENCE,
+          nistReference: NIST_REFERENCE,
+          isoReference: ISO_REFERENCE,
+          unresolvedReason: 'cfn-condition-gated',
+        },
+      ];
+    }
+
     return [
       {
         ruleId: this.id,
         status: 'PASS',
-        filePath: guardrails[0].filePath,
-        description: `${guardrails.length} aws_bedrock_guardrail resource(s) declared in scanned Terraform: ${guardrails.map((g) => g.name).join(', ')}. ${PASS_RUNTIME_CAVEAT}`,
+        filePath: firmGuardrails[0].filePath,
+        description: `${firmGuardrails.length} aws_bedrock_guardrail resource(s) declared in scanned IaC: ${firmGuardrails.map((g) => g.name).join(', ')}. ${PASS_RUNTIME_CAVEAT}`,
         remediation: '',
         regulatoryReference: REGULATORY_REFERENCE,
         nistReference: NIST_REFERENCE,

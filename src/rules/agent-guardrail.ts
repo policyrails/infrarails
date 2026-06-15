@@ -1,7 +1,7 @@
 import { ScanRule, Finding, ParsedFile, ScanContext } from '../types';
-import { findResources, findResourceLine, getNestedValue } from '../utils/resource-helpers';
+import { findResources, findResourceLine, getNestedValue, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
-import { buildGuardrailGraph, GuardrailLink } from '../utils/guardrail-graph';
+import { buildGuardrailGraph, GuardrailLink, isDeclaredVersionReference } from '../utils/guardrail-graph';
 
 const REGULATORY_REFERENCE = 'EU AI Act Article 9 - Risk management system for high-risk AI systems';
 const NIST_REFERENCE =
@@ -26,12 +26,14 @@ const RATIONALE =
 // the org layer (sibling rule S-9.x.2 detects "Bedrock is used but no
 // aws_bedrock_guardrail is declared anywhere in scanned files" as a weaker
 // presence signal).
+// The "Scope" label is supplied by the formatters and the SARIF message
+// builder (scopeNote field), so this string must not repeat it.
 const SCOPE_NOTE =
-  'Scope: this rule only verifies Agent-attached guardrails. For raw ' +
+  'This rule only verifies Agent-attached guardrails. For raw ' +
   'InvokeModel / Converse SDK calls, the guardrailIdentifier parameter is ' +
-  'passed in application code and is not verifiable from Terraform - verify ' +
+  'passed in application code and is not verifiable from IaC - verify ' +
   'SDK call sites separately. See also rule S-9.x.2 for guardrail-presence ' +
-  'detection across the scanned Terraform.';
+  'detection across the scanned IaC.';
 
 export const agentGuardrailRule: ScanRule = {
   id: 'S-9.x.1',
@@ -70,8 +72,30 @@ export const agentGuardrailRule: ScanRule = {
     // guardrails visible only via the plan (remote modules).
     const graph = buildGuardrailGraph(files, context.planOverlay);
 
+    // Guardrail-version resources declared in scope. An agent whose
+    // guardrail_version is wired to one of these is pinned to a published,
+    // numbered (immutable) version even when the value is known-after-apply
+    // (CFN Fn::GetAtt, or a same-template HCL reference). Identity comes from
+    // the reference, not the computed value - the HCL-anchored principle.
+    const declaredVersionResources = new Set(
+      findResources(files, 'aws_bedrock_guardrail_version', context.planOverlay).map((v) => v.name),
+    );
+
     return agents.map((agent) => {
       const line = findResourceLine(agent.rawHcl, 'aws_bedrockagent_agent', agent.name);
+
+      // Condition-guarded CFN agent: whether it (and its guardrail wiring)
+      // exists at deploy time is parameter-dependent.
+      const condition = cfnConditionOf(agent.body);
+      if (condition) {
+        return inconclusiveConditional(this, {
+          label: `Bedrock Agent "${agent.name}"`,
+          condition,
+          filePath: agent.filePath,
+          line,
+        });
+      }
+
       const guardrail = getNestedValue(agent.body, 'guardrail_configuration');
 
       if (!guardrail) {
@@ -85,7 +109,8 @@ export const agentGuardrailRule: ScanRule = {
             'Add a guardrail_configuration block to aws_bedrockagent_agent referencing an ' +
             'aws_bedrock_guardrail (with guardrail_identifier set to the guardrail ID and ' +
             'guardrail_version pinned to a numbered version, not "DRAFT"). ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -115,7 +140,8 @@ export const agentGuardrailRule: ScanRule = {
           description: `Bedrock Agent "${agent.name}" declares guardrail_configuration but guardrail_identifier is empty or unset - no guardrail is actually attached.`,
           remediation:
             'Set guardrail_identifier to the ID (or ARN) of an aws_bedrock_guardrail resource. ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -135,11 +161,12 @@ export const agentGuardrailRule: ScanRule = {
           description:
             `Bedrock Agent "${agent.name}" attaches a guardrail by reference ` +
             `(aws_bedrock_guardrail.${link.guardrail}) whose definition is not in the scanned ` +
-            `Terraform. It may live in a separate platform/security stack.`,
+            `IaC. It may live in a separate platform/security stack.`,
           remediation:
             'Scan the stack that declares aws_bedrock_guardrail.' +
             `${link.guardrail}, or document the cross-stack arrangement. ` +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -157,8 +184,12 @@ export const agentGuardrailRule: ScanRule = {
       const idUnresolved = resolvedByReference ? false : isUnresolvedScalar(id);
       // A version pinned through the reference chain (an aws_bedrock_guardrail_version
       // resource) is resolved even when the literal value is known-after-apply.
+      // Two equivalent forms count: the cross-module config walk (declared-via-
+      // module), and a direct reference to an in-scope guardrail_version resource
+      // (a CFN Fn::GetAtt [GRVersion, Version], or a same-template HCL ref).
       const versionPinnedByReference =
-        link.kind === 'declared-via-module' && link.versionPin === 'versioned';
+        (link.kind === 'declared-via-module' && link.versionPin === 'versioned') ||
+        isDeclaredVersionReference(version, declaredVersionResources);
       const versionUnresolved =
         !versionPinnedByReference && version !== undefined && isUnresolvedScalar(version);
       if (idUnresolved || versionUnresolved) {
@@ -177,7 +208,8 @@ export const agentGuardrailRule: ScanRule = {
           remediation:
             'Inline a literal guardrail_identifier and a numbered guardrail_version, or rerun ' +
             'the scan with resolved values (e.g. via terraform plan output) so attachment can ' +
-            `be verified. Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `be verified. Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,
@@ -195,7 +227,8 @@ export const agentGuardrailRule: ScanRule = {
             'Pin guardrail_version to a numbered version (e.g. "1", "2") published from an ' +
             'aws_bedrock_guardrail_version resource. DRAFT versions can be edited in place, so ' +
             'a passing audit today can be a failing one tomorrow with no Terraform diff. ' +
-            `Why: ${RATIONALE} ${SCOPE_NOTE}`,
+            `Why: ${RATIONALE}`,
+          scopeNote: SCOPE_NOTE,
           regulatoryReference: REGULATORY_REFERENCE,
           nistReference: NIST_REFERENCE,
           isoReference: ISO_REFERENCE,

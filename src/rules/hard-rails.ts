@@ -1,5 +1,5 @@
-import { ScanRule, Finding, ParsedFile, ScanContext, UnresolvableReason, PlanOverlay } from '../types';
-import { findResources, findResourceLine, getNestedValue, FoundResource } from '../utils/resource-helpers';
+import { ScanRule, Finding, FindingDetail, ParsedFile, ScanContext, UnresolvableReason, PlanOverlay } from '../types';
+import { findResources, findResourceLine, getNestedValue, FoundResource, cfnConditionOf, inconclusiveConditional } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 import { resolveExpression } from '../resolver';
 import { buildGuardrailGraph } from '../utils/guardrail-graph';
@@ -54,12 +54,14 @@ const ISO_REFERENCE =
 
 // Scope note appended to non-PASS remediation so multi-vendor users are not
 // misled into reading a clean S-9.x.3 as covering their entire safety stack.
+// The "Scope" label is supplied by the formatters (terminal/HTML/PDF) and the
+// SARIF message builder, so this string must not repeat it.
 const VENDOR_SCOPE_NOTE =
-  'Scope: this rule inspects AWS Bedrock Guardrail bodies only. It does not see ' +
+  'This rule inspects AWS Bedrock Guardrail bodies only. It does not see ' +
   'non-AWS guardrail vendors or SDK-layer (InvokeModel/Converse) enforcement.';
 
 const UNATTACHED_NOTE =
-  ' Not attached to any Bedrock Agent in scanned Terraform; if used via SDK ' +
+  'Not attached to any Bedrock Agent in the scanned IaC; if used via SDK ' +
   'InvokeModel/Converse this is expected and not verifiable here.';
 
 // PROMPT_ATTACK accepts LOW as blocking (any non-NONE strength is a real
@@ -119,7 +121,7 @@ export const hardRailsRule: ScanRule = {
           status: 'SKIP',
           filePath: '',
           description:
-            'No aws_bedrock_guardrail declared in scanned Terraform. Body inspection ' +
+            'No aws_bedrock_guardrail declared in scanned IaC. Body inspection ' +
             'skipped - see S-9.x.2 for the presence-layer signal.',
           remediation: '',
           regulatoryReference: REGULATORY_REFERENCE,
@@ -152,6 +154,18 @@ function evaluateGuardrail(
   const body = gr.body;
   const label = guardrailLabel(gr.name, attachingAgents);
 
+  // Condition-guarded CFN guardrail: its body cannot be trusted to exist at
+  // deploy time, so body inspection cannot produce a PASS/WARN verdict.
+  const condition = cfnConditionOf(body);
+  if (condition) {
+    return inconclusiveConditional(rule, {
+      label,
+      condition,
+      filePath: gr.filePath,
+      line,
+    });
+  }
+
   const base = {
     ruleId: rule.id,
     filePath: gr.filePath,
@@ -168,8 +182,11 @@ function evaluateGuardrail(
       ...base,
       status: 'WARN',
       description:
-        `${label} declares no policy body - it cannot block, deny, redact, or ground ` +
-        `anything.${attachingAgents.length === 0 ? UNATTACHED_NOTE : ''}`,
+        `${label} declares no policy body - it cannot block, deny, redact, or ground anything.`,
+      context: attachingAgents.length === 0
+        ? [{ label: 'Attachment', text: UNATTACHED_NOTE }]
+        : undefined,
+      scopeNote: VENDOR_SCOPE_NOTE,
       remediation: emptyRemediation(),
     };
   }
@@ -207,7 +224,8 @@ function evaluateGuardrail(
         `${label} declares a mandatory surface whose decisive value is expression-driven ` +
         `(${fields}). Static scanning cannot determine whether it enforces any block at ` +
         `runtime. Rerun with --plan to resolve.`,
-      remediation: gapRemediation(),
+      scopeNote: VENDOR_SCOPE_NOTE,
+      remediation: gapRemediation(promptAttack, harmful),
       unresolvedReason: mandatoryInconclusive.unresolvedReason,
     };
   }
@@ -236,31 +254,46 @@ function evaluateGuardrail(
     } else {
       stillEnforcing.push('a harmful-content filter (MEDIUM+)');
     }
+    const context: FindingDetail[] = [];
+    if (stillEnforcing.length > 0) {
+      context.push({ label: 'Still enforcing', text: stillEnforcing.join(' and ') });
+    }
+    context.push(...conditionalContext(pii, grounding, denyTopics));
+    if (attachingAgents.length === 0) {
+      context.push({ label: 'Attachment', text: UNATTACHED_NOTE });
+    }
     return {
       ...base,
       status: 'WARN',
       description:
-        `${label} is missing a mandatory control: ${missing.join('; ')}. Attaching this ` +
-        `guardrail satisfies S-9.x.1 / S-9.x.2 but leaves the named risk uncontrolled.` +
-        (stillEnforcing.length > 0
-          ? ` The other mandatory surface is enforcing: ${stillEnforcing.join(' and ')}.`
-          : '') +
-        conditionalContext(pii, grounding, denyTopics) +
-        (attachingAgents.length === 0 ? UNATTACHED_NOTE : ''),
-      remediation: gapRemediation(),
+        `${label} is missing a mandatory control: ${missing.join('; ')}. Attaching it ` +
+        `satisfies S-9.x.1 / S-9.x.2 but leaves the named risk uncontrolled.`,
+      context,
+      scopeNote: VENDOR_SCOPE_NOTE,
+      remediation: gapRemediation(promptAttack, harmful),
     };
   }
 
   // (4) Both mandatory surfaces BLOCKING -> PASS.
+  const passContext: FindingDetail[] = [
+    {
+      label: 'Note',
+      text:
+        'The PROMPT_ATTACK filter contributes to adversarial-input resilience but does ' +
+        'not catch indirect injection via RAG/tool outputs.',
+    },
+    ...conditionalContext(pii, grounding, denyTopics),
+  ];
+  if (attachingAgents.length === 0) {
+    passContext.push({ label: 'Attachment', text: UNATTACHED_NOTE });
+  }
   return {
     ...base,
     status: 'PASS',
     description:
       `${label} enforces both mandatory surfaces (prompt-injection filter + ` +
-      `harmful-content filter). The PROMPT_ATTACK filter contributes to adversarial-input ` +
-      `resilience but does not catch indirect injection via RAG/tool outputs.` +
-      conditionalContext(pii, grounding, denyTopics) +
-      (attachingAgents.length === 0 ? UNATTACHED_NOTE : ''),
+      `harmful-content filter).`,
+    context: passContext,
     remediation: '',
   };
 }
@@ -478,12 +511,12 @@ function guardrailLabel(name: string, attachingAgents: string[]): string {
 }
 
 // Describe conditional + informational surfaces for PASS / mandatory-gap WARN
-// finding text. Never gates status - context only.
+// findings as discrete labeled rows. Never gates status - context only.
 function conditionalContext(
   pii: SurfaceResult,
   grounding: SurfaceResult,
   denyTopics: number,
-): string {
+): FindingDetail[] {
   const enforcing: string[] = [];
   const notConfigured: string[] = [];
 
@@ -496,11 +529,13 @@ function conditionalContext(
   if (grounding.state === 'BLOCKING') enforcing.push('contextual grounding');
   else if (grounding.state === 'ABSENT') notConfigured.push('grounding not configured - N/A if non-RAG');
 
-  let text = '';
-  if (enforcing.length > 0) text += ` Also enforcing: ${enforcing.join(', ')}.`;
-  if (notConfigured.length > 0) text += ` Not configured: ${notConfigured.join('; ')}.`;
-  if (denyTopics > 0) text += ` ${denyTopics} denied topic(s) declared (informational).`;
-  return text;
+  const details: FindingDetail[] = [];
+  if (enforcing.length > 0) details.push({ label: 'Also enforcing', text: enforcing.join(', ') });
+  if (notConfigured.length > 0) details.push({ label: 'Not configured', text: notConfigured.join('; ') });
+  if (denyTopics > 0) {
+    details.push({ label: 'Denied topics', text: `${denyTopics} declared (informational)` });
+  }
+  return details;
 }
 
 function emptyRemediation(): string {
@@ -508,15 +543,66 @@ function emptyRemediation(): string {
     'Populate the guardrail body: add a content_policy_config.filters_config block with ' +
     'type = "PROMPT_ATTACK" and input_strength set to any non-NONE value ("LOW", "MEDIUM", ' +
     'or "HIGH"; "MEDIUM"/"HIGH" recommended), and at least one ' +
-    `harmful-content filter (e.g. type = "HATE") set to "MEDIUM"/"HIGH". ${VENDOR_SCOPE_NOTE}`
+    'harmful-content filter (e.g. type = "HATE") set to "MEDIUM"/"HIGH".'
   );
 }
 
-function gapRemediation(): string {
-  return (
-    'Add a PROMPT_ATTACK filter with input_strength set to any non-NONE value ("LOW", ' +
-    '"MEDIUM", or "HIGH"; "MEDIUM"/"HIGH" recommended), and set at least ' +
-    'one harmful-content filter category to "MEDIUM"/"HIGH". PII redaction and contextual ' +
-    `grounding are suggested where applicable but do not gate this check. ${VENDOR_SCOPE_NOTE}`
-  );
+// Build a remediation that names ONLY the mandatory surfaces that are not
+// already enforcing. A BLOCKING surface is omitted entirely, so a guardrail
+// that already filters harmful content is never told to "add a harmful-content
+// filter" - the advice targets the actual gap the finding reported. The PII /
+// grounding "do not gate" note is deliberately dropped: it is redundant with
+// the `Also enforcing` / `Not configured` context rows rendered above it.
+function gapRemediation(promptAttack: SurfaceResult, harmful: SurfaceResult): string {
+  const fixes: string[] = [];
+  const pa = promptAttackFix(promptAttack);
+  if (pa) fixes.push(pa);
+  const hc = harmfulContentFix(harmful);
+  if (hc) fixes.push(hc);
+
+  // Defensive: a gap / mandatory-inconclusive finding always has >= 1
+  // non-BLOCKING mandatory surface, so fixes is normally non-empty. Never emit
+  // an empty remediation if that invariant ever changes.
+  if (fixes.length === 0) {
+    return (
+      'Ensure both mandatory surfaces enforce: a PROMPT_ATTACK filter with a non-NONE ' +
+      'input_strength, and at least one harmful-content filter at "MEDIUM"/"HIGH".'
+    );
+  }
+
+  const sentences = fixes.map((f, i) => (i === 0 ? capitalizeFirst(f) : `Also ${f}`));
+  return `${sentences.join('. ')}.`;
+}
+
+// Per-surface fix clause, lower-case and period-free so gapRemediation can
+// compose them into one or two sentences. Returns undefined when the surface
+// is already BLOCKING (nothing to fix).
+function promptAttackFix(s: SurfaceResult): string | undefined {
+  switch (s.state) {
+    case 'BLOCKING':
+      return undefined;
+    case 'ABSENT':
+      return 'add a PROMPT_ATTACK filter with input_strength set to a non-NONE value ("LOW", "MEDIUM", or "HIGH"; "MEDIUM"/"HIGH" recommended)';
+    case 'PERMISSIVE':
+      return 'raise the PROMPT_ATTACK filter input_strength from NONE to a non-NONE value ("MEDIUM"/"HIGH" recommended)';
+    case 'INCONCLUSIVE':
+      return 'set a literal (non-expression) input_strength on the PROMPT_ATTACK filter so it can be verified statically ("MEDIUM"/"HIGH" recommended)';
+  }
+}
+
+function harmfulContentFix(s: SurfaceResult): string | undefined {
+  switch (s.state) {
+    case 'BLOCKING':
+      return undefined;
+    case 'ABSENT':
+      return 'add at least one harmful-content filter (e.g. type = "HATE") set to "MEDIUM"/"HIGH"';
+    case 'PERMISSIVE':
+      return 'raise at least one harmful-content filter category to "MEDIUM"/"HIGH"';
+    case 'INCONCLUSIVE':
+      return 'set a literal (non-expression) input/output strength on the harmful-content filter so it can be verified statically ("MEDIUM"/"HIGH")';
+  }
+}
+
+function capitalizeFirst(s: string): string {
+  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }

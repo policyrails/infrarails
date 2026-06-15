@@ -228,8 +228,13 @@ describe('formatSarif', () => {
     expect(sarif.$schema).toMatch(/sarif-schema-2\.1\.0\.json$/);
     expect(sarif.runs).toHaveLength(1);
     expect(sarif.runs[0].tool.driver.name).toBe('infrarails');
-    expect(sarif.runs[0].tool.driver.version).toBeDefined();
-    expect(sarif.runs[0].tool.driver.informationUri).toMatch(/^https:\/\//);
+    // version is single-sourced from package.json (injected via define) — assert
+    // it is a real non-empty string and that semanticVersion mirrors it.
+    const driver = sarif.runs[0].tool.driver;
+    expect(typeof driver.version).toBe('string');
+    expect(driver.version.length).toBeGreaterThan(0);
+    expect(driver.semanticVersion).toBe(driver.version);
+    expect(driver.informationUri).toMatch(/^https:\/\//);
   });
 
   it('includes the full rule catalogue, not just rules with findings', () => {
@@ -239,6 +244,22 @@ describe('formatSarif', () => {
     // catalogue of what infrarails can find.
     for (const r of allRules) {
       expect(ruleIds).toContain(r.id);
+    }
+  });
+
+  it('tags every rule with a GitHub Code Scanning security-severity matching its severity', () => {
+    // GitHub Code Scanning only ranks/sorts alerts when each rule carries a
+    // numeric security-severity. FAIL = '7.0' (high), WARN = '4.0' (medium).
+    // Cross-reference allRules by id so this stays valid as rules change.
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    const severityById = new Map(allRules.map((r) => [r.id, r.severity]));
+    const rules: { id: string; properties: { 'security-severity': string } }[] =
+      sarif.runs[0].tool.driver.rules;
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      const severity = severityById.get(rule.id);
+      const expected = severity === 'FAIL' ? '7.0' : '4.0';
+      expect(rule.properties['security-severity']).toBe(expected);
     }
   });
 
@@ -254,8 +275,31 @@ describe('formatSarif', () => {
     expect(byRule.get('S-12.1.1')).toEqual({ level: 'error', kind: 'fail' });
     expect(byRule.get('S-12.1.2a')).toEqual({ level: 'warning', kind: 'fail' });
     expect(byRule.get('S-12.x.4')).toEqual({ level: 'none', kind: 'pass' });
-    expect(byRule.get('S-12.x.1')).toEqual({ level: 'warning', kind: 'review' });
+    // SARIF 3.27.9: a non-'fail' kind requires level='none'. INCONCLUSIVE stays
+    // visible as a warning, so kind must be 'fail' (verdict lives in properties.status).
+    expect(byRule.get('S-12.x.1')).toEqual({ level: 'warning', kind: 'fail' });
     expect(byRule.get('S-9.x.1')).toEqual({ level: 'none', kind: 'notApplicable' });
+  });
+
+  it('honours the SARIF 3.27.9 invariant: kind !== "fail" implies level === "none"', () => {
+    // Regression net across every status: GitHub treats warning+non-fail-kind
+    // unpredictably, so any result whose kind is not 'fail' must carry level 'none'.
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    for (const r of sarif.runs[0].results as { kind: string; level: string }[]) {
+      if (r.kind !== 'fail') {
+        expect(r.level).toBe('none');
+      }
+    }
+  });
+
+  it('sets runs[0].automationDetails.id from the category option (GitHub Code Scanning category)', () => {
+    // Default: the tool name. Without automationDetails.id, two upload-sarif
+    // uploads on one commit silently overwrite each other.
+    const defaultSarif = JSON.parse(formatSarif(sampleFindings));
+    expect(defaultSarif.runs[0].automationDetails.id).toBe('infrarails');
+
+    const categorised = JSON.parse(formatSarif(sampleFindings, { category: 'terraform' }));
+    expect(categorised.runs[0].automationDetails.id).toBe('terraform');
   });
 
   it('emits a result for every finding (including PASS / SKIP for the audit trail)', () => {
@@ -402,9 +446,12 @@ describe('formatSarif', () => {
   it('includes partialFingerprints so GitHub Code Scanning can dedupe across runs', () => {
     const sarif = JSON.parse(formatSarif(sampleFindings));
     const fail = sarif.runs[0].results.find((r: { ruleId: string }) => r.ruleId === 'S-12.1.1');
+    // The fingerprint must be line-independent: it keys on filePath only, with
+    // no `:42` line suffix. Embedding the line would change the fingerprint
+    // whenever code shifts the line, defeating GitHub's cross-run dedupe.
     expect(fail.partialFingerprints).toMatchObject({
       'ruleId/v1': 'S-12.1.1',
-      'location/v1': 'modules/bedrock/main.tf:42',
+      'location/v1': 'modules/bedrock/main.tf',
     });
   });
 
@@ -421,5 +468,54 @@ describe('formatSarif', () => {
     expect(sarif.runs[0].results).toEqual([]);
     // Catalogue is still emitted.
     expect(sarif.runs[0].tool.driver.rules.length).toBeGreaterThan(0);
+  });
+
+  it('derives honest per-rule tags (compliance/security/eu-ai-act always; nist/iso only when mapped)', () => {
+    // Tag-based filtering in consumers must be accurate: a rule with no NIST or
+    // ISO mapping must not advertise those tags. Cross-reference allRules by id
+    // so this stays valid as rules and their mappings change.
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    const ruleById = new Map(allRules.map((r) => [r.id, r]));
+    const rules: { id: string; properties: { tags: string[] } }[] =
+      sarif.runs[0].tool.driver.rules;
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      const source = ruleById.get(rule.id)!;
+      const tags = rule.properties.tags;
+      // Always present (regulatoryReference is required; 'security' activates
+      // the security-severity ranking in GitHub's Security tab).
+      expect(tags).toContain('compliance');
+      expect(tags).toContain('security');
+      expect(tags).toContain('eu-ai-act');
+      // Present IFF the rule actually maps to that framework.
+      expect(tags.includes('nist-ai-rmf')).toBe(Boolean(source.nistReference));
+      expect(tags.includes('iso-42001')).toBe(Boolean(source.isoReference));
+    }
+  });
+
+  it('makes fullDescription a strict, citation-bearing superset of shortDescription', () => {
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    const ruleById = new Map(allRules.map((r) => [r.id, r]));
+    const rules: {
+      id: string;
+      shortDescription: { text: string };
+      fullDescription: { text: string };
+    }[] = sarif.runs[0].tool.driver.rules;
+    // Pick a representative rule that carries the required EU citation.
+    const rule = rules.find((r) => Boolean(ruleById.get(r.id)?.regulatoryReference));
+    expect(rule).toBeDefined();
+    const source = ruleById.get(rule!.id)!;
+    expect(rule!.fullDescription.text).not.toBe(rule!.shortDescription.text);
+    expect(rule!.fullDescription.text).toContain(rule!.shortDescription.text);
+    expect(rule!.fullDescription.text).toContain(source.regulatoryReference);
+  });
+
+  it('points each rule helpUri at an https URL', () => {
+    const sarif = JSON.parse(formatSarif(sampleFindings));
+    const rules: { helpUri: string }[] = sarif.runs[0].tool.driver.rules;
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      expect(rule.helpUri).toMatch(/^https:\/\//);
+    }
   });
 });

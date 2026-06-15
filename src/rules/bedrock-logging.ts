@@ -1,4 +1,4 @@
-import { ScanRule, Finding, ParsedFile, ScanContext } from '../types';
+import { ScanRule, Finding, FindingDetail, ParsedFile, ScanContext } from '../types';
 import {
   findResources,
   findResourceLine,
@@ -8,6 +8,7 @@ import {
   findBedrockDataSources,
   findIamBedrockGrants,
   findBedrockVpcEndpoints,
+  isCfnTemplatePath,
 } from '../utils/resource-helpers';
 import { isUnresolvedScalar } from '../utils/literal';
 
@@ -102,6 +103,24 @@ export const bedrockLoggingRule: ScanRule = {
       return [buildRemoteModuleInconclusive(this.id, remoteModules)];
     }
 
+    // All Bedrock-usage signals come from CloudFormation templates. CFN has
+    // no resource type for Bedrock model invocation logging (the TF
+    // aws_bedrock_model_invocation_logging_configuration has no CFN
+    // counterpart - AWS's own guidance uses a Lambda-backed custom resource
+    // calling the API), so the scanned templates *cannot* declare it. The
+    // honest verdict is INCONCLUSIVE - even under --strict-account-logging,
+    // because logging may be configured via the API/console/custom resource
+    // and a FAIL would demand a fix CFN cannot express.
+    const signalPaths = [
+      ...direct.map((d) => d.filePath),
+      ...indirect.iam.map((g) => g.filePath),
+      ...indirect.vpc.map((v) => v.filePath),
+      ...indirect.dataSources.map((d) => d.filePath),
+    ];
+    if (signalPaths.length > 0 && signalPaths.every((p) => isCfnTemplatePath(p))) {
+      return [buildCfnLoggingGapInconclusive(this.id, direct, indirect, hasAgent, agentNames)];
+    }
+
     // Indirect-only signals (IAM / VPC / data source) and no logging.
     // The deploying resource may be in another stack, so this is never a
     // confident FAIL even under strict mode.
@@ -137,6 +156,7 @@ function evaluateLoggingConfig(
     config.name,
   );
   const loggingConfig = getNestedValue(config.body, 'logging_config');
+  const agentContext = agentScopeContext(hasAgent, agentNames);
 
   const explicitlyDisabled: string[] = [];
   const explicitlyEnabled: string[] = [];
@@ -167,8 +187,8 @@ function evaluateLoggingConfig(
         `Inline literal true/false for *_data_delivery_enabled toggles, omit them entirely ` +
         `(AWS enables all modalities by default when unset), or rerun the scan against ` +
         `terraform plan output where references are resolved. Why: an expression-driven ` +
-        `toggle can hide an all-disabled config that AWS will accept but never write events for.` +
-        agentRemediationAddendum(hasAgent, agentNames),
+        `toggle can hide an all-disabled config that AWS will accept but never write events for.`,
+      ...(agentContext.length > 0 ? { context: agentContext } : {}),
       regulatoryReference: REGULATORY_REFERENCE,
       nistReference: NIST_REFERENCE,
       isoReference: ISO_REFERENCE,
@@ -187,8 +207,8 @@ function evaluateLoggingConfig(
         `(or remove the toggles entirely - when unset, AWS enables all modalities by default). ` +
         `Why: this is one of the most common Article 12 failure modes - the resource exists, ` +
         `Terraform applies cleanly, dashboards look "configured", but the log destination ` +
-        `stays empty. Verify with the AWS console or "aws bedrock get-model-invocation-logging-configuration".` +
-        agentRemediationAddendum(hasAgent, agentNames),
+        `stays empty. Verify with the AWS console or "aws bedrock get-model-invocation-logging-configuration".`,
+      ...(agentContext.length > 0 ? { context: agentContext } : {}),
       regulatoryReference: REGULATORY_REFERENCE,
       nistReference: NIST_REFERENCE,
       isoReference: ISO_REFERENCE,
@@ -212,15 +232,34 @@ function evaluateLoggingConfig(
   };
 }
 
-function agentRemediationAddendum(hasAgent: boolean, agentNames: string[]): string {
-  if (!hasAgent) return '';
-  return (
-    ` Bedrock Agent(s) detected (${agentNames.join(', ')}): aws_bedrock_model_invocation_logging_configuration ` +
-    `captures only the model leg of an InvokeAgent call. To meet Article 12 for agents you also need (a) trace ` +
-    `logging enabled per call (enableTrace=true on InvokeAgent - this is application-level, not Terraform), and ` +
-    `(b) CloudWatch log groups for any action-group Lambda functions, retained at the same horizon as model logs. ` +
-    `Without trace logs, reasoning steps, action-group invocations, and knowledge-base retrievals are not auditable.`
-  );
+/**
+ * The agent caveat as labeled supporting observations rather than a sentence
+ * glued onto the end of `remediation`. Bedrock invocation logging covers only
+ * the model leg of an InvokeAgent call, so for agents it is necessary but not
+ * sufficient - splitting that into short `context[]` lines keeps the headline
+ * fix scannable instead of burying it under a ~90-word run readers skip.
+ * Returns [] when no agent is present, so non-agent findings carry no context.
+ */
+function agentScopeContext(hasAgent: boolean, agentNames: string[]): FindingDetail[] {
+  if (!hasAgent) return [];
+  return [
+    {
+      label: 'Agent scope',
+      text:
+        `Agent(s) detected (${agentNames.join(', ')}): invocation logging captures only the ` +
+        `model leg of an InvokeAgent call - necessary, but not sufficient for an agent.`,
+    },
+    {
+      label: 'Also required',
+      text:
+        'enableTrace=true on each InvokeAgent call (application-level, not IaC), plus CloudWatch ' +
+        'log groups for any action-group Lambdas at the same retention as model logs.',
+    },
+    {
+      label: 'If missing',
+      text: 'Reasoning steps, action-group invocations, and knowledge-base retrievals are not auditable.',
+    },
+  ];
 }
 
 function buildRemoteModuleInconclusive(
@@ -234,6 +273,36 @@ function buildRemoteModuleInconclusive(
     filePath: '',
     description: `No Bedrock resources found in scanned files, but remote module(s) ${names} could not be inspected. Bedrock usage and logging config may be defined inside those modules.`,
     remediation: RUN_PLAN_HINT,
+    regulatoryReference: REGULATORY_REFERENCE,
+    nistReference: NIST_REFERENCE,
+    isoReference: ISO_REFERENCE,
+  };
+}
+
+function buildCfnLoggingGapInconclusive(
+  ruleId: string,
+  direct: DirectUsage[],
+  indirect: IndirectUsage,
+  hasAgent: boolean,
+  agentNames: string[],
+): Finding {
+  const usageSummary = describeUsage(direct, indirect);
+  return {
+    ruleId,
+    status: 'INCONCLUSIVE',
+    filePath: direct[0]?.filePath ?? '',
+    description:
+      `${usageSummary} Bedrock usage was detected in CloudFormation template(s), but ` +
+      `CloudFormation has no resource type for Bedrock model invocation logging, so the ` +
+      `scanned templates cannot declare it. Whether logging is enabled cannot be ` +
+      `determined from these files.`,
+    remediation:
+      'Enable Bedrock invocation logging outside CloudFormation - via the console/API ' +
+      '(PutModelInvocationLoggingConfiguration), a Lambda-backed custom resource, or a ' +
+      'Terraform stack declaring aws_bedrock_model_invocation_logging_configuration. ' +
+      'Verify: aws bedrock get-model-invocation-logging-configuration. If a ' +
+      'Terraform stack manages it, scan that directory too.',
+    ...(hasAgent ? { context: agentScopeContext(hasAgent, agentNames) } : {}),
     regulatoryReference: REGULATORY_REFERENCE,
     nistReference: NIST_REFERENCE,
     isoReference: ISO_REFERENCE,
@@ -274,8 +343,8 @@ function buildStrictModeFail(
       'Why: Article 12(1) mandates *automatic* recording of events throughout the AI system\'s ' +
       'operational lifetime. Without invocation logging, you have no record of what prompts were ' +
       'sent, what responses were returned, or which model version produced them - making bias ' +
-      'investigation, hallucination forensics, and downstream-deployer audits impossible.' +
-      agentRemediationAddendum(hasAgent, agentNames),
+      'investigation, hallucination forensics, and downstream-deployer audits impossible.',
+    ...(hasAgent ? { context: agentScopeContext(hasAgent, agentNames) } : {}),
     regulatoryReference: REGULATORY_REFERENCE,
     nistReference: NIST_REFERENCE,
     isoReference: ISO_REFERENCE,
@@ -295,7 +364,8 @@ function buildPermissiveInconclusive(
     status: 'INCONCLUSIVE',
     filePath: '',
     description: `${usageSummary} No aws_bedrock_model_invocation_logging_configuration found in scanned files. If logging is configured in a separate stack, scan that directory too. Pass --strict-account-logging if this directory covers the entire infra estate and missing logging should be treated as FAIL.`,
-    remediation: RUN_PLAN_HINT + agentRemediationAddendum(hasAgent, agentNames),
+    remediation: RUN_PLAN_HINT,
+    ...(hasAgent ? { context: agentScopeContext(hasAgent, agentNames) } : {}),
     regulatoryReference: REGULATORY_REFERENCE,
     nistReference: NIST_REFERENCE,
     isoReference: ISO_REFERENCE,

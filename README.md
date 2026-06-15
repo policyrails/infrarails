@@ -2,7 +2,7 @@
 
 # infrarails
 
-> Static **EU AI Act / NIST AI RMF / ISO 42001** compliance scanner for **AWS Bedrock** Terraform. Reads your `.tf` files - no deploy, no AWS credentials - and reports which Article 9 (guardrails) and Article 12 (logging, retention, traceability) controls pass, fail, or can't be verified.
+> Static **EU AI Act / NIST AI RMF / ISO 42001** compliance scanner for **AWS Bedrock** Terraform and CloudFormation. Reads your `.tf` files and CloudFormation templates - no deploy, no AWS credentials - and reports which Article 9 (guardrails) and Article 12 (logging, retention, traceability) controls pass, fail, or can't be verified.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![npm version](https://img.shields.io/npm/v/infrarails.svg)](https://www.npmjs.com/package/infrarails)

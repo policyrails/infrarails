@@ -225,7 +225,7 @@ function evaluateGuardrail(
         `(${fields}). Static scanning cannot determine whether it enforces any block at ` +
         `runtime. Rerun with --plan to resolve.`,
       scopeNote: VENDOR_SCOPE_NOTE,
-      remediation: gapRemediation(),
+      remediation: gapRemediation(promptAttack, harmful),
       unresolvedReason: mandatoryInconclusive.unresolvedReason,
     };
   }
@@ -270,7 +270,7 @@ function evaluateGuardrail(
         `satisfies S-9.x.1 / S-9.x.2 but leaves the named risk uncontrolled.`,
       context,
       scopeNote: VENDOR_SCOPE_NOTE,
-      remediation: gapRemediation(),
+      remediation: gapRemediation(promptAttack, harmful),
     };
   }
 
@@ -547,11 +547,62 @@ function emptyRemediation(): string {
   );
 }
 
-function gapRemediation(): string {
-  return (
-    'Add a PROMPT_ATTACK filter with input_strength set to any non-NONE value ("LOW", ' +
-    '"MEDIUM", or "HIGH"; "MEDIUM"/"HIGH" recommended), and set at least ' +
-    'one harmful-content filter category to "MEDIUM"/"HIGH". PII redaction and contextual ' +
-    'grounding are suggested where applicable but do not gate this check.'
-  );
+// Build a remediation that names ONLY the mandatory surfaces that are not
+// already enforcing. A BLOCKING surface is omitted entirely, so a guardrail
+// that already filters harmful content is never told to "add a harmful-content
+// filter" - the advice targets the actual gap the finding reported. The PII /
+// grounding "do not gate" note is deliberately dropped: it is redundant with
+// the `Also enforcing` / `Not configured` context rows rendered above it.
+function gapRemediation(promptAttack: SurfaceResult, harmful: SurfaceResult): string {
+  const fixes: string[] = [];
+  const pa = promptAttackFix(promptAttack);
+  if (pa) fixes.push(pa);
+  const hc = harmfulContentFix(harmful);
+  if (hc) fixes.push(hc);
+
+  // Defensive: a gap / mandatory-inconclusive finding always has >= 1
+  // non-BLOCKING mandatory surface, so fixes is normally non-empty. Never emit
+  // an empty remediation if that invariant ever changes.
+  if (fixes.length === 0) {
+    return (
+      'Ensure both mandatory surfaces enforce: a PROMPT_ATTACK filter with a non-NONE ' +
+      'input_strength, and at least one harmful-content filter at "MEDIUM"/"HIGH".'
+    );
+  }
+
+  const sentences = fixes.map((f, i) => (i === 0 ? capitalizeFirst(f) : `Also ${f}`));
+  return `${sentences.join('. ')}.`;
+}
+
+// Per-surface fix clause, lower-case and period-free so gapRemediation can
+// compose them into one or two sentences. Returns undefined when the surface
+// is already BLOCKING (nothing to fix).
+function promptAttackFix(s: SurfaceResult): string | undefined {
+  switch (s.state) {
+    case 'BLOCKING':
+      return undefined;
+    case 'ABSENT':
+      return 'add a PROMPT_ATTACK filter with input_strength set to a non-NONE value ("LOW", "MEDIUM", or "HIGH"; "MEDIUM"/"HIGH" recommended)';
+    case 'PERMISSIVE':
+      return 'raise the PROMPT_ATTACK filter input_strength from NONE to a non-NONE value ("MEDIUM"/"HIGH" recommended)';
+    case 'INCONCLUSIVE':
+      return 'set a literal (non-expression) input_strength on the PROMPT_ATTACK filter so it can be verified statically ("MEDIUM"/"HIGH" recommended)';
+  }
+}
+
+function harmfulContentFix(s: SurfaceResult): string | undefined {
+  switch (s.state) {
+    case 'BLOCKING':
+      return undefined;
+    case 'ABSENT':
+      return 'add at least one harmful-content filter (e.g. type = "HATE") set to "MEDIUM"/"HIGH"';
+    case 'PERMISSIVE':
+      return 'raise at least one harmful-content filter category to "MEDIUM"/"HIGH"';
+    case 'INCONCLUSIVE':
+      return 'set a literal (non-expression) input/output strength on the harmful-content filter so it can be verified statically ("MEDIUM"/"HIGH")';
+  }
+}
+
+function capitalizeFirst(s: string): string {
+  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }

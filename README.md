@@ -35,15 +35,18 @@ Color-coded findings grouped by status, each cross-referenced to the **EU AI Act
 
 ---
 
-## 🔭 Coming next: drift attestation - proof it *stays* compliant
+## 🔭 Coming next
 
-A passing scan proves your Terraform **declared** the right controls. The next infrarails layer proves your deployed infrastructure **stays** that way:
+`infrarails` scans AWS Bedrock IaC today. Two things are on the way:
 
-> **Continuous "no drift since deployment" attestation** - cryptographically signed, write-once evidence that the infrastructure you scanned is the infrastructure still running. Out-of-band changes are recorded with who/when attribution - **even when they're reverted before anyone looks.**
+- **SageMaker scanning** - endpoints, data-capture & model logging, and guardrail-equivalent controls, mapped to the same EU AI Act / NIST / ISO frameworks.
+- **Drift attestation** - cryptographically signed, write-once evidence that the infrastructure you scanned is the infrastructure still running. Out-of-band changes are recorded with who/when attribution - **even when they're reverted before anyone looks.** Built for the person who has to hand an auditor *evidence*, not screenshots.
 
-Built for the same person the PDF reports are built for: the one who has to hand an auditor *evidence*, not screenshots.
+**Status: in private development.** Join the waitlist and we'll email you the moment each one ships:
 
-**Status: in private development.** Star or watch this repo for the announcement, or open an issue titled `attest: early access` to join the early-access list.
+### 👉 [Join the waitlist →](https://forms.gle/bugEVrnQnWJuVCGg7)
+
+Prefer GitHub? Star or watch this repo, or open an issue titled `waitlist: sagemaker` or `waitlist: drift`.
 
 ---
 

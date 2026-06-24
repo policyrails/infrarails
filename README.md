@@ -8,6 +8,10 @@
 [![npm version](https://img.shields.io/npm/v/infrarails.svg)](https://www.npmjs.com/package/infrarails)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
 
+<p align="center">
+  <img src="assets/demo.gif" alt="infrarails scanning a sample AWS Bedrock recruiter stack and writing a PDF compliance report" width="820" />
+</p>
+
 ---
 
 ## Install and scan in 60 seconds
